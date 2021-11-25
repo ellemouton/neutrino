@@ -616,7 +616,9 @@ func runCheckCFCheckptSanityTestCase(t *testing.T, testCase *cfCheckptTestCase) 
 		}
 	}
 
-	heightDiff, err := checkCFCheckptSanity(testCase.checkpoints, cfStore)
+	heightDiff, err := checkCFCheckptSanity(
+		testCase.checkpoints, cfStore, wire.CFCheckptInterval,
+	)
 	if err != nil {
 		t.Fatalf("Error from checkCFCheckptSanity: %s", err)
 	}

@@ -33,9 +33,23 @@ func newMockBlockHeaderStore() *mockBlockHeaderStore {
 
 func (m *mockBlockHeaderStore) ChainTip() (*wire.BlockHeader,
 	uint32, error) {
-	return nil, 0, nil
 
+	if len(m.heights) == 0 {
+		return nil, 0, nil
+	}
+
+	var maxHeight uint32
+	for h := range m.heights {
+		if h > maxHeight {
+			maxHeight = h
+		}
+	}
+
+	tip := m.heights[maxHeight]
+
+	return &tip, maxHeight, nil
 }
+
 func (m *mockBlockHeaderStore) LatestBlockLocator() (
 	blockchain.BlockLocator, error) {
 	return nil, nil
