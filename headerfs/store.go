@@ -593,22 +593,59 @@ func (h *blockHeaderStore) ChainTip() (*wire.BlockHeader, uint32, error) {
 	return &latestHeader, tipHeight, nil
 }
 
-// FilterHeaderStore is an implementation of a fully fledged database for any
-// variant of filter headers.  The FilterHeaderStore combines a flat file to
+// FilterHeaderStore is an interface that provides an abstraction for a generic
+// store for filter headers.
+type FilterHeaderStore interface {
+	// FetchHeader attempts to retrieve a filter header determined by the
+	// passed block hash.
+	FetchHeader(hash *chainhash.Hash) (*chainhash.Hash, error)
+
+	// FetchHeaderByHeight attempts to retrieve a target filter header based
+	// on a block height.
+	FetchHeaderByHeight(height uint32) (*chainhash.Hash, error)
+
+	// FetchHeaderAncestors fetches the numHeaders filter headers that are
+	// the ancestors of the target stop hash. A total of numHeaders+1
+	// headers will be returned, as we'll walk back numHeaders distance to
+	// collect each header, then return the final header specified by the
+	// stop hash. We'll also return the starting height of the header range
+	// as well so callers can compute the height of each header without
+	// knowing the height of the stop hash.
+	FetchHeaderAncestors(numHeaders uint32,
+		stopHash *chainhash.Hash) ([]chainhash.Hash, uint32, error)
+
+	// WriteHeaders adds a set of headers to the FilterHeaderStore in a
+	// single atomic transaction.
+	WriteHeaders(hdrs ...FilterHeader) error
+
+	// ChainTip returns the best known block header and height for the
+	// FilterHeaderStore.
+	ChainTip() (*chainhash.Hash, uint32, error)
+
+	// RollbackLastBlock rolls back the FilterHeaderStore by a _single_
+	// header. This method is meant to be used in the case of re-org which
+	// disconnects the latest block header from the end of the main chain.
+	// The information about the new header tip after truncation is
+	// returned.
+	RollbackLastBlock(newTip *chainhash.Hash) (*BlockStamp, error)
+}
+
+// filterHeaderStore is an implementation of a fully fledged database for any
+// variant of filter headers.  The filterHeaderStore combines a flat file to
 // store the block headers with a database instance for managing the index into
 // the set of flat files.
-type FilterHeaderStore struct {
+type filterHeaderStore struct {
 	*headerStore
 }
 
-// NewFilterHeaderStore returns a new instance of the FilterHeaderStore based
+// NewFilterHeaderStore returns a new instance of the filterHeaderStore based
 // on a target file path, filter type, and target net parameters. These
 // parameters are required as if this is the initial start up of the
-// FilterHeaderStore, then the initial genesis filter header will need to be
+// filterHeaderStore, then the initial genesis filter header will need to be
 // inserted.
 func NewFilterHeaderStore(filePath string, db walletdb.DB,
 	filterType HeaderType, netParams *chaincfg.Params,
-	headerStateAssertion *FilterHeader) (*FilterHeaderStore, error) {
+	headerStateAssertion *FilterHeader) (FilterHeaderStore, error) {
 
 	fStore, err := newHeaderStore(db, filePath, filterType)
 	if err != nil {
@@ -622,7 +659,7 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 		return nil, err
 	}
 
-	fhs := &FilterHeaderStore{
+	fhs := &filterHeaderStore{
 		fStore,
 	}
 
@@ -727,7 +764,7 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 // maybeResetHeaderState will reset the header state if the header assertion
 // fails, but only if the target height is found. The boolean returned indicates
 // that header state was reset.
-func (f *FilterHeaderStore) maybeResetHeaderState(
+func (f *filterHeaderStore) maybeResetHeaderState(
 	headerStateAssertion *FilterHeader) (bool, error) {
 
 	// First, we'll attempt to locate the header at this height. If no such
@@ -762,7 +799,7 @@ func (f *FilterHeaderStore) maybeResetHeaderState(
 
 // FetchHeader returns the filter header that corresponds to the passed block
 // height.
-func (f *FilterHeaderStore) FetchHeader(hash *chainhash.Hash) (*chainhash.Hash, error) {
+func (f *filterHeaderStore) FetchHeader(hash *chainhash.Hash) (*chainhash.Hash, error) {
 	// Lock store for read.
 	f.mtx.RLock()
 	defer f.mtx.RUnlock()
@@ -776,7 +813,7 @@ func (f *FilterHeaderStore) FetchHeader(hash *chainhash.Hash) (*chainhash.Hash, 
 }
 
 // FetchHeaderByHeight returns the filter header for a particular block height.
-func (f *FilterHeaderStore) FetchHeaderByHeight(height uint32) (*chainhash.Hash, error) {
+func (f *filterHeaderStore) FetchHeaderByHeight(height uint32) (*chainhash.Hash, error) {
 	// Lock store for read.
 	f.mtx.RLock()
 	defer f.mtx.RUnlock()
@@ -790,7 +827,7 @@ func (f *FilterHeaderStore) FetchHeaderByHeight(height uint32) (*chainhash.Hash,
 // then return the final header specified by the stop hash. We'll also return
 // the starting height of the header range as well so callers can compute the
 // height of each header without knowing the height of the stop hash.
-func (f *FilterHeaderStore) FetchHeaderAncestors(numHeaders uint32,
+func (f *filterHeaderStore) FetchHeaderAncestors(numHeaders uint32,
 	stopHash *chainhash.Hash) ([]chainhash.Hash, uint32, error) {
 
 	// First, we'll find the final header in the range, this will be the
@@ -836,7 +873,7 @@ func (f *FilterHeader) toIndexEntry() headerEntry {
 // WriteHeaders writes a batch of filter headers to persistent storage. The
 // headers themselves are appended to the flat file, and then the index updated
 // to reflect the new entires.
-func (f *FilterHeaderStore) WriteHeaders(hdrs ...FilterHeader) error {
+func (f *filterHeaderStore) WriteHeaders(hdrs ...FilterHeader) error {
 	// Lock store for write.
 	f.mtx.Lock()
 	defer f.mtx.Unlock()
@@ -876,8 +913,8 @@ func (f *FilterHeaderStore) WriteHeaders(hdrs ...FilterHeader) error {
 }
 
 // ChainTip returns the latest filter header and height known to the
-// FilterHeaderStore.
-func (f *FilterHeaderStore) ChainTip() (*chainhash.Hash, uint32, error) {
+// filterHeaderStore.
+func (f *filterHeaderStore) ChainTip() (*chainhash.Hash, uint32, error) {
 	// Lock store for read.
 	f.mtx.RLock()
 	defer f.mtx.RUnlock()
@@ -900,7 +937,7 @@ func (f *FilterHeaderStore) ChainTip() (*chainhash.Hash, uint32, error) {
 // re-org which disconnects the latest filter header from the end of the main
 // chain. The information about the latest header tip after truncation is
 // returned.
-func (f *FilterHeaderStore) RollbackLastBlock(newTip *chainhash.Hash) (*BlockStamp, error) {
+func (f *filterHeaderStore) RollbackLastBlock(newTip *chainhash.Hash) (*BlockStamp, error) {
 	// Lock store for write.
 	f.mtx.Lock()
 	defer f.mtx.Unlock()

@@ -224,7 +224,7 @@ func TestBlockHeaderStoreRecovery(t *testing.T) {
 	}
 }
 
-func createTestFilterHeaderStore() (func(), walletdb.DB, string, *FilterHeaderStore, error) {
+func createTestFilterHeaderStore() (func(), walletdb.DB, string, *filterHeaderStore, error) {
 	tempDir, err := ioutil.TempDir("", "store_test")
 	if err != nil {
 		return nil, nil, "", nil, err
@@ -248,7 +248,7 @@ func createTestFilterHeaderStore() (func(), walletdb.DB, string, *FilterHeaderSt
 		db.Close()
 	}
 
-	return cleanUp, db, tempDir, hStore, nil
+	return cleanUp, db, tempDir, hStore.(*filterHeaderStore), nil
 }
 
 func createTestFilterHeaderChain(numHeaders uint32) []FilterHeader {
@@ -430,12 +430,14 @@ func TestFilterHeaderStoreRecovery(t *testing.T) {
 
 	// Next, we'll re-create the block header store in order to trigger the
 	// recovery logic.
-	fhs, err = NewFilterHeaderStore(
+	fhStore, err := NewFilterHeaderStore(
 		tempDir, db, RegularFilter, &chaincfg.SimNetParams, nil,
 	)
 	if err != nil {
 		t.Fatalf("unable to re-create bhs: %v", err)
 	}
+
+	fhs = fhStore.(*filterHeaderStore)
 
 	// The chain tip of this new instance should be of height 5, and match
 	// the 5th to last filter header.

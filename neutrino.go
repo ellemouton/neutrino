@@ -569,7 +569,7 @@ type ChainService struct { // nolint:maligned
 
 	FilterDB         filterdb.FilterDatabase
 	BlockHeaders     headerfs.BlockHeaderStore
-	RegFilterHeaders *headerfs.FilterHeaderStore
+	RegFilterHeaders headerfs.FilterHeaderStore
 	persistToDisk    bool
 
 	FilterCache *lru.Cache
