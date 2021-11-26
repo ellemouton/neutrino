@@ -2,6 +2,7 @@ package neutrino
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/wire"
@@ -40,17 +41,42 @@ type FilterManConfig struct {
 
 type filterMan struct {
 	cfg *FilterManConfig
+
+	// allCFCheckpoints is a map from our peers to the list of filter
+	// checkpoints they respond to us with. We'll attempt to get filter
+	// checkpoints immediately up to the latest block checkpoint we've got
+	// stored to avoid doing unnecessary fetches as the block headers are
+	// catching up.
+	allCFCheckpoints map[string][]*chainhash.Hash
+
+	// lastCp will point to the latest block checkpoint we have for
+	// the active chain, if any.
+	lastBlockCP chaincfg.Checkpoint
+
+	quit chan struct{}
 }
 
 func NewFilterManager(cfg *FilterManConfig) *filterMan {
 	return &filterMan{
-		cfg: cfg,
+		cfg:              cfg,
+		allCFCheckpoints: make(map[string][]*chainhash.Hash),
+		quit:             make(chan struct{}),
 	}
 }
 
 func (f *filterMan) Sync() {
 	// Subscribe to new block header notifications. Wait till block headers
 	// are current OR filter headers are lagging by CP interval.
+
+	// If we have less than a full checkpoint's worth of blocks, such as on
+	// simnet, we don't really need to request checkpoints as we'll get 0
+	// from all peers. We can go on and just request the cfheaders.
+	/*
+		if lastHeight >= wire.CFCheckptInterval {
+			goodCheckpoints := f.syncCheckpoints(0, retryTimeout)
+		}
+	*/
+
 }
 
 func (f *filterMan) resolveConflicts(checkpoints map[string][]*chainhash.Hash) (
@@ -684,4 +710,133 @@ func (f *filterMan) getCFHeadersForAllPeers(height uint32) (
 	)
 
 	return headers, numHeaders
+}
+
+// syncCheckpoints is used to get a list of what we consider to be a list of
+// good checkpoints from our peers.
+func (f *filterMan) syncCheckpoints(lastHeight uint32, lastHash *chainhash.Hash,
+	retryTimeout time.Duration, maxTries int) []*chainhash.Hash {
+
+	// Start by getting the filter checkpoints up to the height of our block
+	// header chain. If we have a chain checkpoint that is past this height,
+	// we use that instead. We do this so we don't have to fetch all filter
+	// checkpoints each time our block header chain advances.
+	// TODO(halseth): fetch filter checkpoints up to the best block of the
+	//  connected peers.
+	bestHeight := lastHeight
+	bestHash := lastHash
+	if bestHeight < uint32(f.lastBlockCP.Height) {
+		bestHeight = uint32(f.lastBlockCP.Height)
+		bestHash = f.lastBlockCP.Hash
+	}
+
+	var (
+		goodCheckpoints []*chainhash.Hash
+		goodPeers       map[string]bool
+		err             error
+		numTries        int
+	)
+	for len(goodCheckpoints) == 0 {
+
+		// Quit if requested.
+		select {
+		case <-f.quit:
+			return nil
+		default:
+		}
+
+		if maxTries > 0 {
+			if numTries >= maxTries {
+				return nil
+			}
+			numTries++
+		}
+
+		// If the height now exceeds the height at which we fetched the
+		// checkpoints last time, we must query our peers again.
+		if minCheckpointHeight(f.allCFCheckpoints) < lastHeight {
+			log.Debugf("Getting filter checkpoints up to "+
+				"height=%v, hash=%v", bestHeight, bestHash)
+
+			// TODO(elle): update getCheckpts to use query interface
+			// so that we can ban peers who are not responding with
+			// checkpoints here.
+			f.allCFCheckpoints = f.getCheckpts(bestHash)
+			if len(f.allCFCheckpoints) == 0 {
+				log.Warnf("Unable to fetch set of " +
+					"candidate checkpoints, trying again...")
+
+				select {
+				case <-time.After(retryTimeout):
+				case <-f.quit:
+					return nil
+				}
+				continue
+			}
+		}
+
+		// Cap the received checkpoints at the current height, as we
+		// can only verify checkpoints up to the height we have block
+		// headers for.
+		checkpoints := make(map[string][]*chainhash.Hash)
+		for p, cps := range f.allCFCheckpoints {
+			for i, cp := range cps {
+				height := uint32(i+1) * f.cfg.CPInterval
+				if height > lastHeight {
+					break
+				}
+				checkpoints[p] = append(checkpoints[p], cp)
+			}
+		}
+
+		// See if we can detect which checkpoint list is correct. If
+		// not, we will cycle again.
+		goodCheckpoints, goodPeers, err = f.resolveConflicts(checkpoints)
+		if err != nil {
+			log.Warnf("got error attempting to determine correct "+
+				"cfheader checkpoints: %v, trying again", err)
+		}
+
+		// Trim allCFCheckpoints of any checkpoints served by bad peers.
+		for p, _ := range f.allCFCheckpoints {
+			if !goodPeers[p] {
+				delete(f.allCFCheckpoints, p)
+			}
+		}
+
+		if len(goodCheckpoints) == 0 {
+			select {
+			case <-time.After(retryTimeout):
+			case <-f.quit:
+				return nil
+			}
+		}
+	}
+
+	return goodCheckpoints
+}
+
+// getCheckpts runs a query for cfcheckpts against all peers and returns a map
+// of responses.
+func (f *filterMan) getCheckpts(
+	lastHash *chainhash.Hash) map[string][]*chainhash.Hash {
+
+	checkpoints := make(map[string][]*chainhash.Hash)
+	getCheckptMsg := wire.NewMsgGetCFCheckpt(f.cfg.FilterType, lastHash)
+	f.cfg.queryAllPeers(
+		getCheckptMsg,
+		func(sp *ServerPeer, resp wire.Message, quit chan<- struct{},
+			peerQuit chan<- struct{}) {
+
+			m, isCheckpoint := resp.(*wire.MsgCFCheckpt)
+			if isCheckpoint {
+				if m.FilterType == f.cfg.FilterType &&
+					m.StopHash == *lastHash {
+					checkpoints[sp.Addr()] = m.FilterHeaders
+					close(peerQuit)
+				}
+			}
+		},
+	)
+	return checkpoints
 }
