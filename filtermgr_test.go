@@ -2,8 +2,17 @@ package neutrino
 
 import (
 	"errors"
+	"fmt"
+	"io/ioutil"
+	"math/rand"
+	"os"
 	"testing"
 	"time"
+
+	"github.com/btcsuite/btcwallet/walletdb"
+
+	"github.com/lightninglabs/neutrino/blockntfns"
+	"github.com/lightninglabs/neutrino/query"
 
 	"github.com/btcsuite/btcutil"
 
@@ -411,7 +420,8 @@ func TestResolveConflicts(t *testing.T) {
 				},
 			}
 
-			fm := NewFilterManager(test.cfg)
+			fm, err := NewFilterManager(test.cfg)
+			require.NoError(t, err)
 
 			cps, goodPeers, err := fm.resolveConflicts(test.cpInputs)
 
@@ -617,7 +627,9 @@ func TestSyncCheckpoints(t *testing.T) {
 				},
 			}
 
-			fm := NewFilterManager(test.cfg)
+			fm, err := NewFilterManager(test.cfg)
+			require.NoError(t, err)
+
 			fm.lastBlockCP = test.lastBlockCP
 
 			goodCPs := fm.syncCheckpoints(
@@ -629,6 +641,517 @@ func TestSyncCheckpoints(t *testing.T) {
 			require.True(t, compareCheckpointMaps(test.expectedAllCPs, fm.allCFCheckpoints))
 		})
 	}
+}
+
+// TestFilterManagerInitialInterval tests that the filter manager is able to
+// handle checkpointed filter header query responses in out of order, and when
+// a partial interval is already written to the store.
+func TestFilterManagerInitialInterval(t *testing.T) {
+	t.Parallel()
+
+	type testCase struct {
+		// permute indicates whether responses should be permutated.
+		permute bool
+
+		// partialInterval indicates whether we should write parts of
+		// the first checkpoint interval to the filter header store
+		// before starting the test.
+		partialInterval bool
+
+		// repeat indicates whether responses should be repeated.
+		repeat bool
+	}
+
+	// Generate all combinations of testcases.
+	var testCases []testCase
+	b := []bool{false, true}
+	for _, perm := range b {
+		for _, part := range b {
+			for _, rep := range b {
+				testCases = append(testCases, testCase{
+					permute:         perm,
+					partialInterval: part,
+					repeat:          rep,
+				})
+			}
+		}
+	}
+
+	for _, test := range testCases {
+		test := test
+		testDesc := fmt.Sprintf("permute=%v, partial=%v, repeat=%v",
+			test.permute, test.partialInterval, test.repeat)
+
+		fm, blockNtfns, cleanUp, err := setupFilterManager()
+		if err != nil {
+			t.Fatalf("unable to set up ChainService: %v", err)
+		}
+		defer cleanUp()
+
+		hdrStore := fm.cfg.BlockHeaderStore
+		cfStore := fm.cfg.FilterHeaderStore
+
+		// Keep track of the filter headers and block headers. Since
+		// the genesis headers are written automatically when the store
+		// is created, we query it to add to the slices.
+		genesisBlockHeader, _, err := hdrStore.ChainTip()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		genesisFilterHeader, _, err := cfStore.ChainTip()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		headers, err := generateHeaders(
+			genesisBlockHeader, genesisFilterHeader, nil,
+		)
+		if err != nil {
+			t.Fatalf("unable to generate headers: %v", err)
+		}
+
+		// Write all block headers but the genesis, since it is already
+		// in the store.
+		err = hdrStore.WriteHeaders(headers.blockHeaders[1:]...)
+		if err != nil {
+			t.Fatalf("Error writing batch of headers: %s", err)
+		}
+
+		// We emulate the case where a few filter headers are already
+		// written to the store by writing 1/3 of the first interval.
+		if test.partialInterval {
+			err = cfStore.WriteHeaders(
+				headers.cfHeaders[1 : wire.CFCheckptInterval/3]...,
+			)
+			if err != nil {
+				t.Fatalf("Error writing batch of headers: %s",
+					err)
+			}
+		}
+
+		// We set up a custom query batch method for this test, as we
+		// will use this to feed the blockmanager with our crafted
+		// responses.
+		fm.cfg.QueryDispatcher.(*mockDispatcher).query = func(
+			requests []*query.Request,
+			options ...query.QueryOption) chan error {
+
+			var msgs []wire.Message
+			for _, q := range requests {
+				msgs = append(msgs, q.Req)
+			}
+
+			responses, err := generateResponses(msgs, headers)
+			if err != nil {
+				t.Fatalf("unable to generate responses: %v",
+					err)
+			}
+
+			// We permute the response order if the test signals
+			// that.
+			perm := rand.Perm(len(responses))
+
+			errChan := make(chan error, 1)
+			go func() {
+				for i, v := range perm {
+					index := i
+					if test.permute {
+						index = v
+					}
+
+					// Before handling the response we take
+					// copies of the message, as we cannot
+					// guarantee that it won't be modified.
+					resp := *responses[index]
+					resp2 := *responses[index]
+
+					// Let the blockmanager handle the
+					// message.
+					progress := requests[index].HandleResp(
+						msgs[index], &resp, "",
+					)
+
+					if !progress.Finished {
+						errChan <- fmt.Errorf("got "+
+							"response false on "+
+							"send of index %d: %v",
+							index, testDesc)
+						return
+					}
+
+					// If we are not testing repeated
+					// responses, go on to the next
+					// response.
+					if !test.repeat {
+						continue
+					}
+
+					// Otherwise resend the response we
+					// just sent.
+					progress = requests[index].HandleResp(
+						msgs[index], &resp2, "",
+					)
+					if !progress.Finished {
+						errChan <- fmt.Errorf("got "+
+							"response false on "+
+							"resend of index %d: "+
+							"%v", index, testDesc)
+						return
+					}
+
+				}
+				errChan <- nil
+			}()
+
+			return errChan
+		}
+
+		// We should expect to see notifications for each new filter
+		// header being connected.
+		startHeight := uint32(1)
+		if test.partialInterval {
+			startHeight = wire.CFCheckptInterval / 3
+		}
+		go func() {
+			for i := startHeight; i <= maxHeight; i++ {
+				ntfn := <-blockNtfns
+				if _, ok := ntfn.(*blockntfns.Connected); !ok {
+					t.Error("expected block connected " +
+						"notification")
+					return
+				}
+			}
+		}()
+
+		// Call the get checkpointed cf headers method with the
+		// checkpoints we created to start the test.
+		err = fm.getCheckpointedCFHeaders(headers.checkpoints)
+		if err != nil {
+			t.Fatalf("error returned from "+
+				"getCheckpointedCFHeaders: %v", err)
+		}
+
+		// Finally make sure the filter header tip is what we expect.
+		tip, tipHeight, err := cfStore.ChainTip()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if tipHeight != maxHeight {
+			t.Fatalf("expected tip height to be %v, was %v",
+				maxHeight, tipHeight)
+		}
+
+		lastCheckpoint := headers.checkpoints[len(headers.checkpoints)-1]
+		if *tip != *lastCheckpoint {
+			t.Fatalf("expected tip to be %v, was %v",
+				lastCheckpoint, tip)
+		}
+	}
+}
+
+// TestFilterManagerInvalidInterval tests that the filter manager is able to
+// determine it is receiving corrupt checkpoints and filter headers.
+func TestFilterManagerInvalidInterval(t *testing.T) {
+	t.Parallel()
+
+	type testCase struct {
+		// wrongGenesis indicates whether we should start deriving the
+		// filters from a wrong genesis.
+		wrongGenesis bool
+
+		// intervalMisaligned indicates whether each interval prev hash
+		// should not line up with the previous checkpoint.
+		intervalMisaligned bool
+
+		// invalidPrevHash indicates whether the interval responses
+		// should have a prev hash that doesn't mathc that interval.
+		invalidPrevHash bool
+
+		// partialInterval indicates whether we should write parts of
+		// the first checkpoint interval to the filter header store
+		// before starting the test.
+		partialInterval bool
+
+		// firstInvalid is the first interval response we expect the
+		// blockmanager to determine is invalid.
+		firstInvalid int
+	}
+
+	testCases := []testCase{
+		// With a set of checkpoints and filter headers calculated from
+		// the wrong genesis, the block manager should be able to
+		// determine that the first interval doesn't line up.
+		{
+			wrongGenesis: true,
+			firstInvalid: 0,
+		},
+
+		// With checkpoints calculated from the wrong genesis, and a
+		// partial set of filter headers already written, the first
+		// interval response should be considered invalid.
+		{
+			wrongGenesis:    true,
+			partialInterval: true,
+			firstInvalid:    0,
+		},
+
+		// With intervals not lining up, the second interval response
+		// should be determined invalid.
+		{
+			intervalMisaligned: true,
+			firstInvalid:       0,
+		},
+
+		// With misaligned intervals and a partial interval written, the
+		// second interval response should be considered invalid.
+		{
+			intervalMisaligned: true,
+			partialInterval:    true,
+			firstInvalid:       0,
+		},
+
+		// With responses having invalid prev hashes, the second
+		// interval response should be deemed invalid.
+		{
+			invalidPrevHash: true,
+			firstInvalid:    1,
+		},
+	}
+
+	for _, test := range testCases {
+		test := test
+		fm, blockNtfns, cleanUp, err := setupFilterManager()
+		if err != nil {
+			t.Fatalf("unable to set up ChainService: %v", err)
+		}
+		defer cleanUp()
+
+		// Create a mock peer to prevent panics when attempting to ban
+		// a peer that served an invalid filter header.
+		mockPeer := newServerPeer(&ChainService{}, false)
+		mockPeer.Peer, err = peer.NewOutboundPeer(
+			newPeerConfig(mockPeer), "127.0.0.1:8333",
+		)
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		hdrStore := fm.cfg.BlockHeaderStore
+		cfStore := fm.cfg.FilterHeaderStore
+
+		// Keep track of the filter headers and block headers. Since
+		// the genesis headers are written automatically when the store
+		// is created, we query it to add to the slices.
+		genesisBlockHeader, _, err := hdrStore.ChainTip()
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		genesisFilterHeader, _, err := cfStore.ChainTip()
+		if err != nil {
+			t.Fatal(err)
+		}
+		// To emulate a full node serving us filter headers derived
+		// from different genesis than what we have, we flip a bit in
+		// the genesis filter header.
+		if test.wrongGenesis {
+			genesisFilterHeader[0] ^= 1
+		}
+
+		headers, err := generateHeaders(genesisBlockHeader,
+			genesisFilterHeader,
+			func(currentCFHeader *chainhash.Hash) {
+				// If we are testing that each interval doesn't
+				// line up properly with the previous, we flip
+				// a bit in the current header before
+				// calculating the next interval checkpoint.
+				if test.intervalMisaligned {
+					currentCFHeader[0] ^= 1
+				}
+			})
+		if err != nil {
+			t.Fatalf("unable to generate headers: %v", err)
+		}
+
+		// Write all block headers but the genesis, since it is already
+		// in the store.
+		if err = hdrStore.WriteHeaders(headers.blockHeaders[1:]...); err != nil {
+			t.Fatalf("Error writing batch of headers: %s", err)
+		}
+
+		// We emulate the case where a few filter headers are already
+		// written to the store by writing 1/3 of the first interval.
+		if test.partialInterval {
+			err = cfStore.WriteHeaders(
+				headers.cfHeaders[1 : wire.CFCheckptInterval/3]...,
+			)
+			if err != nil {
+				t.Fatalf("Error writing batch of headers: %s",
+					err)
+			}
+		}
+
+		fm.cfg.QueryDispatcher.(*mockDispatcher).query = func(
+			requests []*query.Request,
+			options ...query.QueryOption) chan error {
+
+			var msgs []wire.Message
+			for _, q := range requests {
+				msgs = append(msgs, q.Req)
+			}
+			responses, err := generateResponses(msgs, headers)
+			if err != nil {
+				t.Fatalf("unable to generate responses: %v",
+					err)
+			}
+
+			// Since we used the generated checkpoints when
+			// creating the responses, we must flip the
+			// PrevFilterHeader bit back before sending them if we
+			// are checking for misaligned intervals. This to
+			// ensure we don't hit the invalid prev hash case.
+			if test.intervalMisaligned {
+				for i := range responses {
+					if i == 0 {
+						continue
+					}
+					responses[i].PrevFilterHeader[0] ^= 1
+				}
+			}
+
+			// If we are testing for intervals with invalid prev
+			// hashes, we flip a bit to corrup them, regardless of
+			// whether we are testing misaligned intervals.
+			if test.invalidPrevHash {
+				for i := range responses {
+					if i == 0 {
+						continue
+					}
+					responses[i].PrevFilterHeader[1] ^= 1
+				}
+			}
+
+			errChan := make(chan error, 1)
+			go func() {
+
+				// Check that the success of the callback match what we
+				// expect.
+				for i := range responses {
+					progress := requests[i].HandleResp(
+						msgs[i], responses[i], "",
+					)
+					if i == test.firstInvalid {
+						if progress.Finished {
+							t.Errorf("expected interval "+
+								"%d to be invalid", i)
+							return
+						}
+						errChan <- fmt.Errorf("invalid interval")
+						break
+					}
+
+					if !progress.Finished {
+						t.Errorf("expected interval %d to be "+
+							"valid", i)
+						return
+					}
+				}
+
+				errChan <- nil
+			}()
+
+			return errChan
+		}
+
+		// We should expect to see notifications for each new filter
+		// header being connected.
+		startHeight := uint32(1)
+		if test.partialInterval {
+			startHeight = wire.CFCheckptInterval / 3
+		}
+		go func() {
+			for i := startHeight; i <= maxHeight; i++ {
+				ntfn := <-blockNtfns
+				if _, ok := ntfn.(*blockntfns.Connected); !ok {
+					t.Error("expected block connected " +
+						"notification")
+					return
+				}
+			}
+		}()
+
+		// Start the test by calling the get checkpointed cf headers
+		// method with the checkpoints we created.
+		fm.getCheckpointedCFHeaders(headers.checkpoints)
+	}
+}
+
+// setupFilterManager initialises a filterMan to be used in tests.
+func setupFilterManager() (*filterMan, chan blockntfns.BlockNtfn, func(), error) {
+	// Set up the block and filter header stores.
+	tempDir, err := ioutil.TempDir("", "neutrino")
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("failed to create "+
+			"temporary directory: %s", err)
+	}
+
+	db, err := walletdb.Create(
+		"bdb", tempDir+"/weks.db", true, dbOpenTimeout,
+	)
+	if err != nil {
+		os.RemoveAll(tempDir)
+		return nil, nil, nil, fmt.Errorf("error opening DB: %s", err)
+	}
+
+	cleanUp := func() {
+		db.Close()
+		os.RemoveAll(tempDir)
+	}
+
+	hdrStore, err := headerfs.NewBlockHeaderStore(
+		tempDir, db, &chaincfg.SimNetParams,
+	)
+	if err != nil {
+		cleanUp()
+		return nil, nil, nil, fmt.Errorf("error creating block header "+
+			"store: %s", err)
+	}
+
+	cfStore, err := headerfs.NewFilterHeaderStore(
+		tempDir, db, headerfs.RegularFilter, &chaincfg.SimNetParams,
+		nil,
+	)
+	if err != nil {
+		cleanUp()
+		return nil, nil, nil, fmt.Errorf("error creating filter "+
+			"header store: %s", err)
+	}
+
+	filterConnectedChan := make(chan blockntfns.BlockNtfn)
+
+	// Set up a blockManager with the chain service we defined.
+	bm, err := NewFilterManager(&FilterManConfig{
+		CPInterval:         wire.CFCheckptInterval,
+		MaxCFHeadersPerMsg: wire.MaxCFHeadersPerMsg,
+		ChainParams:        chaincfg.SimNetParams,
+		BlockHeaderStore:   hdrStore,
+		FilterHeaderStore:  cfStore,
+		QueryDispatcher:    &mockDispatcher{},
+		BanPeer:            func(string, banman.Reason) error { return nil },
+		onFilterHeaderConnected: func(header wire.BlockHeader, height uint32) {
+			filterConnectedChan <- blockntfns.NewBlockConnected(
+				header, height,
+			)
+		},
+	})
+	if err != nil {
+		return nil, nil, nil, fmt.Errorf("unable to create "+
+			"blockmanager: %v", err)
+	}
+
+	return bm, filterConnectedChan, cleanUp, nil
 }
 
 func compareCheckpointMaps(a, b map[string][]*chainhash.Hash) bool {
