@@ -813,11 +813,13 @@ func (b *blockManager) getUncheckpointedCFHeaders(
 // checkpointedCFHeadersQuery holds all information necessary to perform and
 // handle a query for checkpointed filter headers.
 type checkpointedCFHeadersQuery struct {
-	blockMgr    *blockManager
-	msgs        []wire.Message
-	checkpoints []*chainhash.Hash
-	stopHashes  map[chainhash.Hash]uint32
-	headerChan  chan *wire.MsgCFHeaders
+	banPeer       func(addr string, reason banman.Reason) error
+	genesisHeader chainhash.Hash
+	quit          chan struct{}
+	msgs          []wire.Message
+	checkpoints   []*chainhash.Hash
+	stopHashes    map[chainhash.Hash]uint32
+	headerChan    chan *wire.MsgCFHeaders
 }
 
 // requests creates the query.Requests for this CF headers query.
@@ -876,7 +878,7 @@ func (c *checkpointedCFHeadersQuery) handleResponse(req, resp wire.Message,
 	// Use either the genesis header or the previous checkpoint index as
 	// the previous checkpoint when verifying that the filter headers in
 	// the response match up.
-	prevCheckpoint := &c.blockMgr.genesisHeader
+	prevCheckpoint := &c.genesisHeader
 	if checkPointIndex > 0 {
 		prevCheckpoint = c.checkpoints[checkPointIndex-1]
 	}
@@ -897,9 +899,7 @@ func (c *checkpointedCFHeadersQuery) handleResponse(req, resp wire.Message,
 		// If the peer gives us a header that doesn't match what we
 		// know to be the best checkpoint, then we'll ban the peer so
 		// we can re-allocate the query elsewhere.
-		err := c.blockMgr.cfg.BanPeer(
-			peerAddr, banman.InvalidFilterHeaderCheckpoint,
-		)
+		err := c.banPeer(peerAddr, banman.InvalidFilterHeaderCheckpoint)
 		if err != nil {
 			log.Errorf("Unable to ban peer %v: %v", peerAddr, err)
 		}
@@ -917,7 +917,7 @@ func (c *checkpointedCFHeadersQuery) handleResponse(req, resp wire.Message,
 	// move on to the next query.
 	select {
 	case c.headerChan <- r:
-	case <-c.blockMgr.quit:
+	case <-c.quit:
 		return query.Progress{
 			Finished:   false,
 			Progressed: false,
@@ -1040,11 +1040,13 @@ func (b *blockManager) getCheckpointedCFHeaders(checkpoints []*chainhash.Hash,
 	// dynamically.
 	headerChan := make(chan *wire.MsgCFHeaders, len(queryMsgs))
 	q := checkpointedCFHeadersQuery{
-		blockMgr:    b,
-		msgs:        queryMsgs,
-		checkpoints: checkpoints,
-		stopHashes:  stopHashes,
-		headerChan:  headerChan,
+		banPeer:       b.cfg.BanPeer,
+		genesisHeader: b.genesisHeader,
+		quit:          b.quit,
+		msgs:          queryMsgs,
+		checkpoints:   checkpoints,
+		stopHashes:    stopHashes,
+		headerChan:    headerChan,
 	}
 
 	// Hand the queries to the work manager, and consume the verified
