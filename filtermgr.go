@@ -6,6 +6,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/lightninglabs/neutrino/blockntfns"
+
 	"github.com/lightninglabs/neutrino/query"
 
 	"github.com/btcsuite/btcd/chaincfg"
@@ -46,6 +48,16 @@ type FilterManConfig struct {
 
 	// QueryDispatcher is used to make queries to connected Bitcoin peers.
 	QueryDispatcher query.Dispatcher
+
+	// SubscribeBlocks returns a block subscription that delivers block
+	// notifications in order.
+	SubscribeBlocks func() (*blockntfns.Subscription, error)
+
+	BlockHeaderTip func() uint32
+
+	BlockHeadersSynced func() bool
+
+	BlockHeaderTipHash func() chainhash.Hash
 }
 
 type filterMan struct {
@@ -124,24 +136,160 @@ func NewFilterManager(cfg *FilterManConfig) (*filterMan, error) {
 	}
 	fm.genesisHeader = *genesisHeader
 
+	// Set the lastBlockCP variable to the latest block checkpoint if we
+	// have any for this chain. Otherwise this block checkpoint will just
+	// stay at height 0, which will prompt us to look at the block headers
+	// to fetch checkpoints.
+	blockCheckpoints := cfg.ChainParams.Checkpoints
+	if len(blockCheckpoints) > 0 {
+		fm.lastBlockCP = blockCheckpoints[len(blockCheckpoints)-1]
+	}
+
 	return fm, nil
 }
 
-func (f *filterMan) Sync() {
-	// Subscribe to new block header notifications. Wait till block headers
-	// are current OR filter headers are lagging by CP interval.
+func (f *filterMan) Sync() error {
+	// Subscribe to new block header notifications.
+	sub, err := f.cfg.SubscribeBlocks()
+	if err != nil {
+		return fmt.Errorf("unable to subscribe for block "+
+			"notifications: %v", err)
+	}
+	blockNtfns := sub.Notifications
+
+	var (
+		blockHeaderTipHeight uint32
+		blockHeaderTip       wire.BlockHeader
+		blockHeaderTipHash   chainhash.Hash
+		ntfn                 blockntfns.BlockNtfn
+	)
+
+waitForHeaders:
+	// We'll wait until the main header sync is either finished or the
+	// filter headers are lagging at least a checkpoint interval behind the
+	// block headers, before we actually start to sync the set of
+	// cfheaders. We do this to speed up the sync, as the check pointed
+	// sync is faster, than fetching each header from each peer during the
+	// normal "at tip" syncing.
+	f.newFilterHeadersMtx.RLock()
+	log.Infof("Waiting for more block headers, then will start "+
+		"cfheaders sync from height %v...", f.filterHeaderTip)
+
+	blockHeaderTipHeight = f.cfg.BlockHeaderTip()
+
+	for !(f.filterHeaderTip+f.cfg.CPInterval <= blockHeaderTipHeight ||
+		f.cfg.BlockHeadersSynced()) {
+
+		f.newFilterHeadersMtx.RUnlock()
+
+		select {
+		case ntfn = <-blockNtfns:
+			blockHeaderTipHeight = ntfn.Height()
+		case <-f.quit:
+			return nil
+		}
+
+		// Re-acquire the lock in order to check for the filter header
+		// tip at the next iteration of the loop.
+		f.newFilterHeadersMtx.RLock()
+	}
+	f.newFilterHeadersMtx.RUnlock()
+
+	// Now that the block headers are finished or ahead of the filter
+	// headers, we'll grab the current chain tip so we can base our filter
+	// header sync off of that.
+	lastHeader, lastHeight, err := f.cfg.BlockHeaderStore.ChainTip()
+	if err != nil {
+		return err
+	}
+	lastHash := lastHeader.BlockHash()
+
+	f.newFilterHeadersMtx.RLock()
+	log.Infof("Starting cfheaders sync from (block_height=%v, "+
+		"block_hash=%v) to (block_height=%v, block_hash=%v)",
+		f.filterHeaderTip, f.filterHeaderTipHash, lastHeight,
+		lastHeader.BlockHash())
+	f.newFilterHeadersMtx.RUnlock()
+
+	log.Infof(
+		"Starting cfheaders sync for filter_type=%v", f.cfg.FilterType,
+	)
 
 	// If we have less than a full checkpoint's worth of blocks, such as on
 	// simnet, we don't really need to request checkpoints as we'll get 0
 	// from all peers. We can go on and just request the cfheaders.
-	/*
-		var goodCheckpoints []*chainhash.Hash
-		if lastHeight >= wire.CFCheckptInterval {
-			goodCheckpoints = f.syncCheckpoints(0, &chainhash.Hash{} retryTimeout, 0)
-		}
-		f.getCheckpointedCFHeaders(goodCheckpoints)
-	*/
+	var goodCheckpoints []*chainhash.Hash
+	if lastHeight >= f.cfg.CPInterval {
+		goodCheckpoints = f.syncCheckpoints(
+			lastHeight, &lastHash, retryTimeout, 0,
+		)
+	}
 
+	// Get all the headers up to the last known good checkpoint.
+	if err = f.getCheckpointedCFHeaders(goodCheckpoints); err != nil {
+		return err
+	}
+
+	// Now we check the headers again. If the block headers are not yet
+	// current, then we go back to the loop waiting for them to finish.
+	if !f.cfg.BlockHeadersSynced() {
+		goto waitForHeaders
+	}
+
+	// If block headers are current, but the filter header tip is still
+	// lagging more than a checkpoint interval behind the block header tip,
+	// we also go back to the loop to utilize the faster check pointed
+	// fetching.
+	f.newFilterHeadersMtx.RLock()
+	if f.filterHeaderTip+f.cfg.CPInterval <= f.cfg.BlockHeaderTip() {
+		f.newFilterHeadersMtx.RUnlock()
+
+		goto waitForHeaders
+	}
+	f.newFilterHeadersMtx.RUnlock()
+
+	log.Infof("Fully caught up with cfheaders at height "+
+		"%v, waiting at tip for new blocks", lastHeight)
+
+	// Now that we've been fully caught up to the tip of the current header
+	// chain, we'll wait here for a signal that more blocks have been
+	// connected. If this happens then we'll do another round to fetch the
+	// new set of filter new set of filter headers
+	blockHeaderTipHash = f.cfg.BlockHeaderTipHash()
+	for {
+		// We'll wait until the filter header tip and the header tip
+		// are mismatched.
+		f.newFilterHeadersMtx.RLock()
+		for f.filterHeaderTipHash == blockHeaderTipHash {
+			f.newFilterHeadersMtx.RUnlock()
+
+			select {
+			case ntfn = <-blockNtfns:
+				blockHeaderTip = ntfn.Header()
+				blockHeaderTipHash = blockHeaderTip.BlockHash()
+			case <-f.quit:
+				return nil
+			}
+
+			// Re-acquire the lock in order to check for the filter
+			// header tip at the next iteration of the loop.
+			f.newFilterHeadersMtx.RLock()
+		}
+		f.newFilterHeadersMtx.RUnlock()
+
+		// At this point, we know that there're a set of new filter
+		// headers to fetch, so we'll grab them now.
+		if err = f.getUncheckpointedCFHeaders(); err != nil {
+			log.Debugf("couldn't get uncheckpointed headers for "+
+				"%v: %v", f.cfg.FilterType, err)
+
+			select {
+			case <-time.After(retryTimeout):
+			case <-f.quit:
+				return nil
+			}
+		}
+	}
 }
 
 func (f *filterMan) resolveConflicts(checkpoints map[string][]*chainhash.Hash) (
