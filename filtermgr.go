@@ -1261,3 +1261,107 @@ func (f *filterMan) writeCFHeadersMsg(msg *wire.MsgCFHeaders) (*chainhash.Hash,
 
 	return &lastHeader, lastHeight, nil
 }
+
+// getUncheckpointedCFHeaders gets the next batch of cfheaders from the
+// network, if it can, and resolves any conflicts between them. It then writes
+// any verified headers to the store.
+func (f *filterMan) getUncheckpointedCFHeaders() error {
+	// Get the filter header store's chain tip.
+	filterTip, filtHeight, err := f.cfg.FilterHeaderStore.ChainTip()
+	if err != nil {
+		return fmt.Errorf("error getting filter chain tip: %v", err)
+	}
+	blockHeader, blockHeight, err := f.cfg.BlockHeaderStore.ChainTip()
+	if err != nil {
+		return fmt.Errorf("error getting block chain tip: %v", err)
+	}
+
+	// If the block height is somehow before the filter height, then this
+	// means that we may still be handling a re-org, so we'll bail our so
+	// we can retry after a timeout.
+	if blockHeight < filtHeight {
+		return fmt.Errorf("reorg in progress, waiting to get "+
+			"uncheckpointed cfheaders (block height %d, filter "+
+			"height %d", blockHeight, filtHeight)
+	}
+
+	// If the heights match, then we're fully synced, so we don't need to
+	// do anything from there.
+	if blockHeight == filtHeight {
+		log.Tracef("cfheaders already caught up to blocks")
+		return nil
+	}
+
+	log.Infof("Attempting to fetch set of un-checkpointed filters "+
+		"at height=%v, hash=%v", blockHeight, blockHeader.BlockHash())
+
+	// Query all peers for the responses.
+	startHeight := filtHeight + 1
+	headers, numHeaders := f.getCFHeadersForAllPeers(startHeight)
+
+	// Ban any peer that responds with the wrong prev filter header.
+	for peer, msg := range headers {
+		if msg.PrevFilterHeader != *filterTip {
+			err := f.cfg.BanPeer(peer, banman.InvalidFilterHeader)
+			if err != nil {
+				log.Errorf("Unable to ban peer %v: %v", peer, err)
+			}
+			delete(headers, peer)
+		}
+	}
+
+	if len(headers) == 0 {
+		return fmt.Errorf("couldn't get cfheaders from peers")
+	}
+
+	// For each header, go through and check whether all headers messages
+	// have the same filter hash. If we find a difference, get the block,
+	// calculate the filter, and throw out any mismatching peers.
+	for i := 0; i < numHeaders; i++ {
+		if checkForCFHeaderMismatch(headers, i) {
+			targetHeight := startHeight + uint32(i)
+
+			badPeers, err := f.detectBadPeers(
+				headers, targetHeight, uint32(i),
+			)
+			if err != nil {
+				return err
+			}
+
+			log.Warnf("Banning %v peers due to invalid filter "+
+				"headers", len(badPeers))
+
+			for _, peer := range badPeers {
+				err := f.cfg.BanPeer(
+					peer, banman.InvalidFilterHeader,
+				)
+				if err != nil {
+					log.Errorf("Unable to ban peer %v: %v",
+						peer, err)
+				}
+				delete(headers, peer)
+			}
+		}
+	}
+
+	// Get the longest filter hash chain and write it to the store.
+	key, maxLen := "", 0
+	for peer, msg := range headers {
+		if len(msg.FilterHashes) > maxLen {
+			key, maxLen = peer, len(msg.FilterHashes)
+		}
+	}
+
+	// We'll now fetch the set of pristine headers from the map. If ALL the
+	// peers were banned, then we won't have a set of headers at all. We'll
+	// return nil so we can go to the top of the loop and fetch from a new
+	// set of peers.
+	pristineHeaders, ok := headers[key]
+	if !ok {
+		return fmt.Errorf("all peers served bogus headers, retrying " +
+			"with new set")
+	}
+
+	_, _, err = f.writeCFHeadersMsg(pristineHeaders)
+	return err
+}
