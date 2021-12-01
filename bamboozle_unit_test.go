@@ -4,8 +4,8 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"sort"
 	"testing"
+	"time"
 
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
@@ -15,6 +15,16 @@ import (
 	"github.com/btcsuite/btcutil/gcs/builder"
 	"github.com/btcsuite/btcwallet/walletdb"
 	"github.com/lightninglabs/neutrino/headerfs"
+)
+
+const (
+	// maxHeight is the height we will generate filter headers up to. We use an odd
+	// number of checkpoints to ensure we can test cases where the block manager is
+	// only able to fetch filter headers for one checkpoint interval rather than
+	// two.
+	maxHeight = 21 * uint32(wire.CFCheckptInterval)
+
+	dbOpenTimeout = time.Second * 10
 )
 
 func decodeHashNoError(str string) *chainhash.Hash {
@@ -658,62 +668,45 @@ func TestCheckForCFHeadersMismatch(t *testing.T) {
 	}
 }
 
-func TestResolveFilterMismatchFromBlock(t *testing.T) {
-	t.Parallel()
+// buildNonPushScriptFilter creates a CFilter with all output scripts except all
+// OP_RETURNS with push-only scripts.
+//
+// NOTE: this is not a valid filter, only for tests.
+func buildNonPushScriptFilter(block *wire.MsgBlock) (*gcs.Filter, error) {
+	blockHash := block.BlockHash()
+	b := builder.WithKeyHash(&blockHash)
 
-	// The correct filter should have the coinbase output and the regular
-	// script output.
-	if correctFilter.N() != 2 {
-		t.Fatalf("expected new filter to have only 2 element, had %d",
-			correctFilter.N())
-	}
-
-	// The oldfilter should in addition have the non-push OP_RETURN output.
-	if oldFilter.N() != 3 {
-		t.Fatalf("expected old filter to have only 3 elements, had %d",
-			oldFilter.N())
-	}
-
-	// The oldOldFilter both OP_RETURN outputs.
-	if oldOldFilter.N() != 4 {
-		t.Fatalf("expected old filter to have 4 elements, had %d",
-			oldOldFilter.N())
-	}
-
-	for _, testCase := range resolveFilterTestCases {
-		testCase := testCase
-		t.Run(testCase.name, func(t *testing.T) {
-			badPeers, err := resolveFilterMismatchFromBlock(
-				block, wire.GCSFilterRegular, testCase.peerFilters,
-				testCase.banThreshold,
-			)
-			if err != nil {
-				switch {
-				case testCase.expectedErr == nil:
-					t.Fatalf("Expected no error, got %v", err)
-
-				case err.Error() != testCase.expectedErr.Error():
-					t.Fatalf("Expected error %v, got %v",
-						testCase.expectedErr, err)
-				}
-
-				return
+	for _, tx := range block.Transactions {
+		for _, txOut := range tx.TxOut {
+			// The old version of BIP-158 skipped OP_RETURNs that
+			// had a push-only script.
+			if txOut.PkScript[0] == txscript.OP_RETURN &&
+				txscript.IsPushOnlyScript(txOut.PkScript[1:]) {
+				continue
 			}
 
-			if len(badPeers) != len(testCase.badPeers) {
-				t.Fatalf("Banned wrong peers.\nExpected: "+
-					"%#v\nGot: %#v", testCase.badPeers,
-					badPeers)
-			}
-
-			sort.Strings(badPeers)
-			for i := 0; i < len(badPeers); i++ {
-				if badPeers[i] != testCase.badPeers[i] {
-					t.Fatalf("Banned wrong peers.\n"+
-						"Expected: %#v\nGot: %#v",
-						testCase.badPeers, badPeers)
-				}
-			}
-		})
+			b.AddEntry(txOut.PkScript)
+		}
 	}
+
+	return b.Build()
+}
+
+// buildAllPkScriptsFilter creates a CFilter with all output scripts, including
+// OP_RETURNS.
+//
+// NOTE: this is not a valid filter, only for tests.
+func buildAllPkScriptsFilter(block *wire.MsgBlock) (*gcs.Filter, error) {
+	blockHash := block.BlockHash()
+	b := builder.WithKeyHash(&blockHash)
+
+	for _, tx := range block.Transactions {
+		for _, txOut := range tx.TxOut {
+			// An old version of BIP-158 included all output
+			// scripts.
+			b.AddEntry(txOut.PkScript)
+		}
+	}
+
+	return b.Build()
 }

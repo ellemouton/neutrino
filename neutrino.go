@@ -580,24 +580,26 @@ type ChainService struct { // nolint:maligned
 	queryPeers func(wire.Message, func(*ServerPeer, wire.Message,
 		chan<- struct{}), ...QueryOption)
 
-	chainParams          chaincfg.Params
-	addrManager          *addrmgr.AddrManager
-	connManager          *connmgr.ConnManager
-	blockManager         *blockManager
-	blockSubscriptionMgr *blockntfns.SubscriptionManager
-	newPeers             chan *ServerPeer
-	donePeers            chan *ServerPeer
-	query                chan interface{}
-	firstPeerConnect     chan struct{}
-	peerHeightsUpdate    chan updatePeerHeightsMsg
-	wg                   sync.WaitGroup
-	quit                 chan struct{}
-	timeSource           blockchain.MedianTimeSource
-	services             wire.ServiceFlag
-	utxoScanner          *UtxoScanner
-	broadcaster          *pushtx.Broadcaster
-	banStore             banman.Store
-	workManager          *query.WorkManager
+	chainParams               chaincfg.Params
+	addrManager               *addrmgr.AddrManager
+	connManager               *connmgr.ConnManager
+	blockManager              *blockManager
+	filterMan                 *filterMan
+	blocksOnlySubscriptionMgr *blockntfns.SubscriptionManager
+	blockSubscriptionMgr      *blockntfns.SubscriptionManager
+	newPeers                  chan *ServerPeer
+	donePeers                 chan *ServerPeer
+	query                     chan interface{}
+	firstPeerConnect          chan struct{}
+	peerHeightsUpdate         chan updatePeerHeightsMsg
+	wg                        sync.WaitGroup
+	quit                      chan struct{}
+	timeSource                blockchain.MedianTimeSource
+	services                  wire.ServiceFlag
+	utxoScanner               *UtxoScanner
+	broadcaster               *pushtx.Broadcaster
+	banStore                  banman.Store
+	workManager               *query.WorkManager
 
 	// peerSubscribers is a slice of active peer subscriptions, that we
 	// will notify each time a new peer is connected.
@@ -728,17 +730,39 @@ func NewChainService(cfg Config) (*ChainService, error) {
 		BlockHeaders:     s.BlockHeaders,
 		RegFilterHeaders: s.RegFilterHeaders,
 		TimeSource:       s.timeSource,
-		QueryDispatcher:  s.workManager,
-		BanPeer:          s.BanPeer,
-		GetBlock:         s.GetBlock,
-		firstPeerSignal:  s.firstPeerConnect,
-		queryAllPeers:    s.queryAllPeers,
 	})
 	if err != nil {
 		return nil, err
 	}
 	s.blockManager = bm
 	s.blockSubscriptionMgr = blockntfns.NewSubscriptionManager(s.blockManager)
+	s.blocksOnlySubscriptionMgr = blockntfns.NewSubscriptionManager(s.blockManager.blockOnlyNtfns)
+
+	fm, err := NewFilterManager(&FilterManConfig{
+		FilterType:         wire.GCSFilterRegular,
+		ChainParams:        s.chainParams,
+		CPInterval:         wire.CFCheckptInterval,
+		MaxCFHeadersPerMsg: wire.MaxCFHeadersPerMsg,
+		FilterHeaderStore:  s.RegFilterHeaders,
+		BlockHeaderStore:   s.BlockHeaders,
+		BanPeer:            s.BanPeer,
+		GetBlock: func(hash chainhash.Hash) (*btcutil.Block, error) {
+			return s.GetBlock(hash)
+		},
+		queryAllPeers: s.queryAllPeers,
+		onFilterHeaderConnected: func(header wire.BlockHeader, height uint32) {
+			bm.onBlockConnected(header, height)
+		},
+		QueryDispatcher: s.workManager,
+		SubscribeBlocks: func() (*blockntfns.Subscription, error) {
+			return s.blocksOnlySubscriptionMgr.NewSubscription(0)
+		},
+		BlockHeaderTip:     bm.blockHeaderTip,
+		BlockHeadersSynced: bm.BlockHeadersSynced,
+		BlockHeaderTipHash: bm.blockHeaderTipHash,
+		firstPeerSignal:    s.firstPeerConnect,
+	})
+	s.filterMan = fm
 
 	// Only setup a function to return new addresses to connect to when not
 	// running in connect-only mode.  The simulation network is always in
@@ -1524,6 +1548,8 @@ func (s *ChainService) Start() error {
 	// needed by peers.
 	s.addrManager.Start()
 	s.blockManager.Start()
+	s.blocksOnlySubscriptionMgr.Start()
+	s.filterMan.Start()
 	s.blockSubscriptionMgr.Start()
 	if err := s.workManager.Start(); err != nil {
 		return fmt.Errorf("unable to start work manager: %v", err)
@@ -1568,6 +1594,8 @@ func (s *ChainService) Stop() error {
 		returnErr = err
 	}
 	s.blockSubscriptionMgr.Stop()
+	s.filterMan.Stop()
+	s.blocksOnlySubscriptionMgr.Stop()
 	if err := s.blockManager.Stop(); err != nil {
 		log.Errorf("error stopping block manager: %v", err)
 		returnErr = err

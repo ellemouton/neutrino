@@ -1,11 +1,13 @@
 package neutrino
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -173,6 +175,207 @@ func TestFilterManagerDetectBadPeers(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+}
+
+func assertBadPeers(expBad map[string]struct{}, badPeers []string) error {
+	remBad := make(map[string]struct{})
+	for p := range expBad {
+		remBad[p] = struct{}{}
+	}
+	for _, peer := range badPeers {
+		_, ok := remBad[peer]
+		if !ok {
+			return fmt.Errorf("did not expect %v to be bad", peer)
+		}
+		delete(remBad, peer)
+	}
+
+	if len(remBad) != 0 {
+		return fmt.Errorf("did expect more bad peers")
+	}
+
+	return nil
+}
+
+// mockDispatcher implements the query.Dispatcher interface and allows us to
+// set up a custom Query method during tests.
+type mockDispatcher struct {
+	query func(requests []*query.Request,
+		options ...query.QueryOption) chan error
+}
+
+var _ query.Dispatcher = (*mockDispatcher)(nil)
+
+func (m *mockDispatcher) Query(requests []*query.Request,
+	options ...query.QueryOption) chan error {
+
+	return m.query(requests, options...)
+}
+
+// headers wraps the different headers and filters used throughout the tests.
+type headers struct {
+	blockHeaders []headerfs.BlockHeader
+	cfHeaders    []headerfs.FilterHeader
+	checkpoints  []*chainhash.Hash
+	filterHashes []chainhash.Hash
+}
+
+// generateHeaders generates block headers, filter header and hashes, and
+// checkpoints from the given genesis. The onCheckpoint method will be called
+// with the current cf header on each checkpoint to modify the derivation of
+// the next interval.
+func generateHeaders(genesisBlockHeader *wire.BlockHeader,
+	genesisFilterHeader *chainhash.Hash,
+	onCheckpoint func(*chainhash.Hash)) (*headers, error) {
+
+	var blockHeaders []headerfs.BlockHeader
+	blockHeaders = append(blockHeaders, headerfs.BlockHeader{
+		BlockHeader: genesisBlockHeader,
+		Height:      0,
+	})
+
+	var cfHeaders []headerfs.FilterHeader
+	cfHeaders = append(cfHeaders, headerfs.FilterHeader{
+		HeaderHash: genesisBlockHeader.BlockHash(),
+		FilterHash: *genesisFilterHeader,
+		Height:     0,
+	})
+
+	// The filter hashes (not the filter headers!) will be sent as
+	// part of the CFHeaders response, so we also keep track of
+	// them.
+	genesisFilter, err := builder.BuildBasicFilter(
+		chaincfg.SimNetParams.GenesisBlock, nil,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("unable to build genesis filter: %v",
+			err)
+	}
+
+	genesisFilterHash, err := builder.GetFilterHash(genesisFilter)
+	if err != nil {
+		return nil, fmt.Errorf("unable to get genesis filter hash: %v",
+			err)
+	}
+
+	var filterHashes []chainhash.Hash
+	filterHashes = append(filterHashes, genesisFilterHash)
+
+	// Also keep track of the current filter header. We use this to
+	// calculate the next filter header, as it commits to the
+	// previous.
+	currentCFHeader := *genesisFilterHeader
+
+	// checkpoints will be the checkpoints passed to
+	// getCheckpointedCFHeaders.
+	var checkpoints []*chainhash.Hash
+
+	for height := uint32(1); height <= maxHeight; height++ {
+		header := heightToHeader(height)
+		blockHeader := headerfs.BlockHeader{
+			BlockHeader: header,
+			Height:      height,
+		}
+
+		blockHeaders = append(blockHeaders, blockHeader)
+
+		// It doesn't really matter what filter the filter
+		// header commit to, so just use the height as a nonce
+		// for the filters.
+		filterHash := chainhash.Hash{}
+		binary.BigEndian.PutUint32(filterHash[:], height)
+		filterHashes = append(filterHashes, filterHash)
+
+		// Calculate the current filter header, and add to our
+		// slice.
+		currentCFHeader = chainhash.DoubleHashH(
+			append(filterHash[:], currentCFHeader[:]...),
+		)
+		cfHeaders = append(cfHeaders, headerfs.FilterHeader{
+			HeaderHash: header.BlockHash(),
+			FilterHash: currentCFHeader,
+			Height:     height,
+		})
+
+		// Each interval we must record a checkpoint.
+		if height%wire.CFCheckptInterval == 0 {
+			// We must make a copy of the current header to
+			// avoid mutation.
+			cfh := currentCFHeader
+			checkpoints = append(checkpoints, &cfh)
+
+			if onCheckpoint != nil {
+				onCheckpoint(&currentCFHeader)
+			}
+		}
+	}
+
+	return &headers{
+		blockHeaders: blockHeaders,
+		cfHeaders:    cfHeaders,
+		checkpoints:  checkpoints,
+		filterHashes: filterHashes,
+	}, nil
+}
+
+// generateResponses generates the MsgCFHeaders messages from the given queries
+// and headers.
+func generateResponses(msgs []wire.Message,
+	headers *headers) ([]*wire.MsgCFHeaders, error) {
+
+	// Craft a response for each message.
+	var responses []*wire.MsgCFHeaders
+	for _, msg := range msgs {
+		// Only GetCFHeaders expected.
+		q, ok := msg.(*wire.MsgGetCFHeaders)
+		if !ok {
+			return nil, fmt.Errorf("got unexpected message %T",
+				msg)
+		}
+
+		// The start height must be set to a checkpoint height+1.
+		if q.StartHeight%wire.CFCheckptInterval != 1 {
+			return nil, fmt.Errorf("unexpexted start height %v",
+				q.StartHeight)
+		}
+
+		var prevFilterHeader chainhash.Hash
+		switch q.StartHeight {
+
+		// If the start height is 1 the prevFilterHeader is set to the
+		// genesis header.
+		case 1:
+			genesisFilterHeader := headers.cfHeaders[0].FilterHash
+			prevFilterHeader = genesisFilterHeader
+
+		// Otherwise we use one of the created checkpoints.
+		default:
+			j := q.StartHeight/wire.CFCheckptInterval - 1
+			prevFilterHeader = *headers.checkpoints[j]
+		}
+
+		resp := &wire.MsgCFHeaders{
+			FilterType:       q.FilterType,
+			StopHash:         q.StopHash,
+			PrevFilterHeader: prevFilterHeader,
+		}
+
+		// Keep adding filter hashes until we reach the stop hash.
+		for h := q.StartHeight; ; h++ {
+			resp.FilterHashes = append(
+				resp.FilterHashes, &headers.filterHashes[h],
+			)
+
+			blockHash := headers.blockHeaders[h].BlockHash()
+			if blockHash == q.StopHash {
+				break
+			}
+		}
+
+		responses = append(responses, resp)
+	}
+
+	return responses, nil
 }
 
 func TestResolveConflicts(t *testing.T) {
@@ -1227,6 +1430,66 @@ func TestFilterManagerInvalidInterval(t *testing.T) {
 		// Start the test by calling the get checkpointed cf headers
 		// method with the checkpoints we created.
 		fm.getCheckpointedCFHeaders(headers.checkpoints)
+	}
+}
+
+func TestResolveFilterMismatchFromBlock(t *testing.T) {
+	t.Parallel()
+
+	// The correct filter should have the coinbase output and the regular
+	// script output.
+	if correctFilter.N() != 2 {
+		t.Fatalf("expected new filter to have only 2 element, had %d",
+			correctFilter.N())
+	}
+
+	// The oldfilter should in addition have the non-push OP_RETURN output.
+	if oldFilter.N() != 3 {
+		t.Fatalf("expected old filter to have only 3 elements, had %d",
+			oldFilter.N())
+	}
+
+	// The oldOldFilter both OP_RETURN outputs.
+	if oldOldFilter.N() != 4 {
+		t.Fatalf("expected old filter to have 4 elements, had %d",
+			oldOldFilter.N())
+	}
+
+	for _, testCase := range resolveFilterTestCases {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			badPeers, err := resolveFilterMismatchFromBlock(
+				block, wire.GCSFilterRegular, testCase.peerFilters,
+				testCase.banThreshold,
+			)
+			if err != nil {
+				switch {
+				case testCase.expectedErr == nil:
+					t.Fatalf("Expected no error, got %v", err)
+
+				case err.Error() != testCase.expectedErr.Error():
+					t.Fatalf("Expected error %v, got %v",
+						testCase.expectedErr, err)
+				}
+
+				return
+			}
+
+			if len(badPeers) != len(testCase.badPeers) {
+				t.Fatalf("Banned wrong peers.\nExpected: "+
+					"%#v\nGot: %#v", testCase.badPeers,
+					badPeers)
+			}
+
+			sort.Strings(badPeers)
+			for i := 0; i < len(badPeers); i++ {
+				if badPeers[i] != testCase.badPeers[i] {
+					t.Fatalf("Banned wrong peers.\n"+
+						"Expected: %#v\nGot: %#v",
+						testCase.badPeers, badPeers)
+				}
+			}
+		})
 	}
 }
 
