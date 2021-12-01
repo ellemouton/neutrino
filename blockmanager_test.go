@@ -1438,26 +1438,26 @@ func TestResolveConflicts(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		peers := newMockPeers(t, test.peers)
-		test.cfg.BanPeer = peers.banPeer
-		test.cfg.queryAllPeers = peers.queryAllPeers
-		test.cfg.RegFilterHeaders = &mockFilterHeaderStore{
-			headers: []*chainhash.Hash{
-				hashFromStr("55551471732f4fbfe7a25f6a03acc1413300d5c56ae8e06b95046b8e4c0f32b3"),
-			},
-		}
-		test.cfg.BlockHeaders = &mockBlockHeaderStore{
-			headers: map[chainhash.Hash]wire.BlockHeader{},
-			heights: map[uint32]wire.BlockHeader{
-				0: {},
-				2: {},
-			},
-		}
-
+		test := test
 		t.Run(test.name, func(t *testing.T) {
+			peers := newMockPeers(t, test.peers)
+			test.cfg.BanPeer = peers.banPeer
+			test.cfg.queryAllPeers = peers.queryAllPeers
+			test.cfg.RegFilterHeaders = &mockFilterHeaderStore{
+				headers: []*chainhash.Hash{
+					hashFromStr("55551471732f4fbfe7a25f6a03acc1413300d5c56ae8e06b95046b8e4c0f32b3"),
+				},
+			}
+			test.cfg.BlockHeaders = &mockBlockHeaderStore{
+				headers: map[chainhash.Hash]wire.BlockHeader{},
+				heights: map[uint32]wire.BlockHeader{
+					0: {},
+					2: {},
+				},
+			}
+
 			bm, err := newBlockManager(test.cfg)
 			require.NoError(t, err)
-
 			cps, goodPeers, err := bm.resolveConflict(
 				test.cpInputs, bm.cfg.RegFilterHeaders,
 				wire.GCSFilterRegular,
@@ -1640,29 +1640,30 @@ func TestSyncCheckpoints(t *testing.T) {
 	}
 
 	for _, test := range tests {
-		peers := newMockPeers(t, test.peers, test.nextPeers...)
-		test.cfg.BanPeer = peers.banPeer
-		test.cfg.CFCheckpointInterval = 2
-		test.cfg.queryAllPeers = peers.queryAllPeers
-		test.cfg.RegFilterHeaders = &mockFilterHeaderStore{
-			headers: []*chainhash.Hash{
-				hashFromStr(""),
-			},
-		}
-		test.cfg.BlockHeaders = &mockBlockHeaderStore{
-			headers: map[chainhash.Hash]wire.BlockHeader{},
-			heights: map[uint32]wire.BlockHeader{
-				0: {},
-				2: {},
-			},
-		}
-
+		test := test
 		t.Run(test.name, func(t *testing.T) {
+			peers := newMockPeers(t, test.peers, test.nextPeers...)
+			test.cfg.BanPeer = peers.banPeer
+			test.cfg.CFCheckpointInterval = 2
+			test.cfg.queryAllPeers = peers.queryAllPeers
+			test.cfg.RegFilterHeaders = &mockFilterHeaderStore{
+				headers: []*chainhash.Hash{
+					hashFromStr(""),
+				},
+			}
+			test.cfg.BlockHeaders = &mockBlockHeaderStore{
+				headers: map[chainhash.Hash]wire.BlockHeader{},
+				heights: map[uint32]wire.BlockHeader{
+					0: {},
+					2: {},
+				},
+			}
+
 			fm, err := newBlockManager(test.cfg)
 			require.NoError(t, err)
 
 			allCPCheckpoints := make(map[string][]*chainhash.Hash)
-			goodCPs := make([]*chainhash.Hash, 0)
+			var goodCPs []*chainhash.Hash
 			goodCPs, allCPCheckpoints = fm.syncCheckpoints(
 				test.lastBlockHeight, test.lastBlockHash,
 				test.lastBlockCP, allCPCheckpoints,

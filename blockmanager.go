@@ -733,7 +733,7 @@ func (b *blockManager) syncCheckpoints(lastHeight uint32,
 		}
 
 		// Trim allCFCheckpoints of any checkpoints served by bad peers.
-		for p, _ := range allCFCheckpoints {
+		for p := range allCFCheckpoints {
 			if !goodPeers[p] {
 				delete(allCFCheckpoints, p)
 			}
