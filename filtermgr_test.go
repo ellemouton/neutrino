@@ -6,6 +6,7 @@ import (
 	"io/ioutil"
 	"math/rand"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -33,6 +34,146 @@ import (
 
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 )
+
+// TestFilterManagerDetectBadPeers checks that we detect bad peers, like peers
+// not responding to our filter query, serving inconsistent filters etc.
+func TestFilterManagerDetectBadPeers(t *testing.T) {
+	t.Parallel()
+
+	var (
+		stopHash        = chainhash.Hash{}
+		prev            = chainhash.Hash{}
+		startHeight     = uint32(100)
+		badIndex        = uint32(5)
+		targetIndex     = startHeight + badIndex
+		fType           = wire.GCSFilterRegular
+		filterBytes, _  = correctFilter.NBytes()
+		filterHash, _   = builder.GetFilterHash(correctFilter)
+		blockHeader     = wire.BlockHeader{}
+		targetBlockHash = block.BlockHash()
+
+		peers  = []string{"good1:1", "good2:1", "bad:1", "good3:1"}
+		expBad = map[string]struct{}{
+			"bad:1": {},
+		}
+	)
+
+	testCases := []struct {
+		// filterAnswers is used by each testcase to set the anwers we
+		// want each peer to respond with on filter queries.
+		filterAnswers func(string, map[string]wire.Message)
+	}{
+		{
+			// We let the "bad" peers not respond to the filter
+			// query. They should be marked bad because they are
+			// unresponsive. We do this to ensure peers cannot
+			// only respond to us with headers, and stall our sync
+			// by not responding to filter requests.
+			filterAnswers: func(p string,
+				answers map[string]wire.Message) {
+
+				if strings.Contains(p, "bad") {
+					return
+				}
+
+				answers[p] = wire.NewMsgCFilter(
+					fType, &targetBlockHash, filterBytes,
+				)
+			},
+		},
+		{
+			// We let the "bad" peers serve filters that don't hash
+			// to the filter headers they have sent.
+			filterAnswers: func(p string,
+				answers map[string]wire.Message) {
+
+				filterData := filterBytes
+				if strings.Contains(p, "bad") {
+					filterData, _ = fakeFilter1.NBytes()
+				}
+
+				answers[p] = wire.NewMsgCFilter(
+					fType, &targetBlockHash, filterData,
+				)
+			},
+		},
+	}
+
+	for _, test := range testCases {
+		// Create a mock block header store. We only need to be able to
+		// serve a header for the target index.
+		blockHeaders := newMockBlockHeaderStore()
+		blockHeaders.heights[targetIndex] = blockHeader
+
+		// We set up the mock queryAllPeers to only respond according to
+		// the active testcase.
+		answers := make(map[string]wire.Message)
+		queryAllPeers := func(
+			queryMsg wire.Message,
+			checkResponse func(sp *ServerPeer, resp wire.Message,
+				quit chan<- struct{}, peerQuit chan<- struct{}),
+			options ...QueryOption) {
+
+			for p, resp := range answers {
+				pp, err := peer.NewOutboundPeer(
+					&peer.Config{}, p,
+				)
+				if err != nil {
+					panic(err)
+				}
+
+				sp := &ServerPeer{
+					Peer: pp,
+				}
+				checkResponse(
+					sp, resp, make(chan struct{}),
+					make(chan struct{}),
+				)
+			}
+		}
+
+		for _, peer := range peers {
+			test.filterAnswers(peer, answers)
+		}
+
+		// For the CFHeaders, we pretend all peers responded with the
+		// same filter headers.
+		msg := &wire.MsgCFHeaders{
+			FilterType:       fType,
+			StopHash:         stopHash,
+			PrevFilterHeader: prev,
+		}
+
+		for i := uint32(0); i < 2*badIndex; i++ {
+			_ = msg.AddCFHash(&filterHash)
+		}
+
+		headers := make(map[string]*wire.MsgCFHeaders)
+		for _, peer := range peers {
+			headers[peer] = msg
+		}
+
+		fm := &filterMan{
+			cfg: &FilterManConfig{
+				BlockHeaderStore: blockHeaders,
+				queryAllPeers:    queryAllPeers,
+			},
+		}
+
+		// Now trying to detect which peers are bad, we should detect
+		// the bad ones.
+		badPeers, err := fm.detectBadPeers(
+			headers, targetIndex, badIndex,
+		)
+		if err != nil {
+			t.Fatalf("failed to detect bad peers: %v", err)
+		}
+
+		if err := assertBadPeers(expBad, badPeers); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
 
 func TestResolveConflicts(t *testing.T) {
 	tests := []struct {
@@ -977,7 +1118,8 @@ func TestFilterManagerInvalidInterval(t *testing.T) {
 
 		// Write all block headers but the genesis, since it is already
 		// in the store.
-		if err = hdrStore.WriteHeaders(headers.blockHeaders[1:]...); err != nil {
+		err = hdrStore.WriteHeaders(headers.blockHeaders[1:]...)
+		if err != nil {
 			t.Fatalf("Error writing batch of headers: %s", err)
 		}
 
