@@ -724,15 +724,17 @@ func NewChainService(cfg Config) (*ChainService, error) {
 	}
 
 	bm, err := newBlockManager(&blockManagerCfg{
-		ChainParams:      s.chainParams,
-		BlockHeaders:     s.BlockHeaders,
-		RegFilterHeaders: s.RegFilterHeaders,
-		TimeSource:       s.timeSource,
-		QueryDispatcher:  s.workManager,
-		BanPeer:          s.BanPeer,
-		GetBlock:         s.GetBlock,
-		firstPeerSignal:  s.firstPeerConnect,
-		queryAllPeers:    s.queryAllPeers,
+		CFCheckpointInterval: wire.CFCheckptInterval,
+		MaxCFHeadersPerMsg:   wire.MaxCFHeadersPerMsg,
+		ChainParams:          s.chainParams,
+		BlockHeaders:         s.BlockHeaders,
+		RegFilterHeaders:     s.RegFilterHeaders,
+		TimeSource:           s.timeSource,
+		QueryDispatcher:      s.workManager,
+		BanPeer:              s.BanPeer,
+		GetBlock:             s.GetBlock,
+		firstPeerSignal:      s.firstPeerConnect,
+		queryAllPeers:        s.queryAllPeers,
 	})
 	if err != nil {
 		return nil, err
