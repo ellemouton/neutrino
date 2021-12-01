@@ -156,13 +156,6 @@ type blockManager struct { // nolint:maligned
 	// same time, newHeadersMtx should always be acquired first.
 	newHeadersMtx sync.RWMutex
 
-	// newHeadersSignal is condition variable which will be used to notify
-	// any waiting callers (via Broadcast()) that the tip of the current
-	// chain has changed. This is useful when callers need to know we have
-	// a new tip, but not necessarily each block that was connected during
-	// switch over.
-	newHeadersSignal *sync.Cond
-
 	// filterHeaderTip will be set to the height of the current filter
 	// header tip at all times.  Callers MUST hold the lock below each time
 	// they read/write from this field.
@@ -200,6 +193,9 @@ type blockManager struct { // nolint:maligned
 	// blockNtfnChan is a channel in which the latest block notifications
 	// for the tip of the chain will be sent upon.
 	blockNtfnChan chan blockntfns.BlockNtfn
+
+	newBlockSignal        *newBlockSignal
+	newBlockSignalManager *blockntfns.SubscriptionManager
 
 	wg   sync.WaitGroup
 	quit chan struct{}
@@ -248,7 +244,6 @@ func newBlockManager(cfg *blockManagerCfg) (*blockManager, error) {
 	// Next we'll create the two signals that goroutines will use to wait
 	// on a particular header chain height before starting their normal
 	// duties.
-	bm.newHeadersSignal = sync.NewCond(&bm.newHeadersMtx)
 	bm.newFilterHeadersSignal = sync.NewCond(&bm.newFilterHeadersMtx)
 
 	// We fetch the genesis header to use for verifying the first received
@@ -287,7 +282,75 @@ func newBlockManager(cfg *blockManagerCfg) (*blockManager, error) {
 	}
 	bm.filterHeaderTipHash = fh.BlockHash()
 
+	bm.newBlockSignal = &newBlockSignal{
+		bm:       &bm,
+		ntfnChan: make(chan blockntfns.BlockNtfn),
+	}
+	bm.newBlockSignalManager = blockntfns.NewSubscriptionManager(
+		bm.newBlockSignal,
+	)
+
 	return &bm, nil
+}
+
+func (b *blockManager) onNewBlock(header wire.BlockHeader, height uint32) {
+	select {
+	case b.newBlockSignal.ntfnChan <- blockntfns.NewBlockConnected(header, height):
+	case <-b.quit:
+	}
+}
+
+type newBlockSignal struct {
+	bm       *blockManager
+	ntfnChan chan blockntfns.BlockNtfn
+}
+
+func (n *newBlockSignal) Notifications() <-chan blockntfns.BlockNtfn {
+	return n.ntfnChan
+}
+
+func (n *newBlockSignal) NotificationsSinceHeight(height uint32) (
+	[]blockntfns.BlockNtfn, uint32, error) {
+
+	n.bm.newHeadersMtx.RLock()
+	bestHeight := n.bm.headerTip
+	n.bm.newHeadersMtx.RUnlock()
+
+	// If a height of 0 is provided by the caller, then a backlog of
+	// notifications is not needed.
+	if height == 0 {
+		return nil, bestHeight, nil
+	}
+
+	// If the best height matches the filter header tip, then we're done and
+	// don't need to proceed any further.
+	if bestHeight == height {
+		return nil, bestHeight, nil
+	}
+
+	// If the request has a height later than a height we've yet to come
+	// across in the chain, we'll return an error to indicate so to the
+	// caller.
+	if height > bestHeight {
+		return nil, 0, fmt.Errorf("request with height %d is greater "+
+			"than best height known %d", height, bestHeight)
+	}
+
+	// Otherwise, we need to read block headers from disk to deliver a
+	// backlog to the caller before we proceed.
+	blocks := make([]blockntfns.BlockNtfn, 0, bestHeight-height)
+	for i := height + 1; i <= bestHeight; i++ {
+		header, err := n.bm.cfg.BlockHeaders.FetchHeaderByHeight(i)
+		if err != nil {
+			return nil, 0, err
+		}
+
+		blocks = append(blocks, blockntfns.NewBlockConnected(
+			*header, i,
+		))
+	}
+
+	return blocks, bestHeight, nil
 }
 
 // Start begins the core block handler which processes block and inv messages.
@@ -298,6 +361,7 @@ func (b *blockManager) Start() {
 	}
 
 	log.Trace("Starting block manager")
+	b.newBlockSignalManager.Start()
 	b.wg.Add(2)
 	go b.blockHandler()
 	go func() {
@@ -314,7 +378,9 @@ func (b *blockManager) Start() {
 		}
 
 		log.Debug("Peer connected, starting cfHandler.")
-		b.cfHandler()
+		if err := b.cfHandler(); err != nil {
+			log.Criticalf("cfHandler exited with error: %v", err)
+		}
 	}()
 }
 
@@ -341,10 +407,11 @@ func (b *blockManager) Stop() error {
 			case <-ticker.C:
 			}
 
-			b.newHeadersSignal.Broadcast()
 			b.newFilterHeadersSignal.Broadcast()
 		}
 	}()
+
+	b.newBlockSignalManager.Stop()
 
 	log.Infof("Block manager shutting down")
 	close(b.quit)
@@ -462,7 +529,7 @@ func (b *blockManager) handleDonePeerMsg(peers *list.List, sp *ServerPeer) {
 // cfHandler is the cfheader download handler for the block manager. It must be
 // run as a goroutine. It requests and processes cfheaders messages in a
 // separate goroutine from the peer handlers.
-func (b *blockManager) cfHandler() {
+func (b *blockManager) cfHandler() error {
 	defer log.Trace("Committed filter header handler done")
 
 	var (
@@ -490,6 +557,12 @@ func (b *blockManager) cfHandler() {
 		lastCp = blockCheckpoints[len(blockCheckpoints)-1]
 	}
 
+	newBlocksSub, err := b.newBlockSignalManager.NewSubscription(0)
+	if err != nil {
+		return err
+	}
+	newBlockNtfnChan := newBlocksSub.Notifications
+
 waitForHeaders:
 	// We'll wait until the main header sync is either finished or the
 	// filter headers are lagging at least a checkpoint interval behind the
@@ -500,36 +573,36 @@ waitForHeaders:
 	log.Infof("Waiting for more block headers, then will start "+
 		"cfheaders sync from height %v...", b.filterHeaderTip)
 
-	b.newHeadersSignal.L.Lock()
+	b.newHeadersMtx.RLock()
 	b.newFilterHeadersMtx.RLock()
-	for !(b.filterHeaderTip+wire.CFCheckptInterval <= b.headerTip || b.BlockHeadersSynced()) {
+	for !(b.filterHeaderTip+wire.CFCheckptInterval <= b.headerTip ||
+		b.BlockHeadersSynced()) {
+
 		b.newFilterHeadersMtx.RUnlock()
-		b.newHeadersSignal.Wait()
+		b.newHeadersMtx.RUnlock()
 
 		// While we're awake, we'll quickly check to see if we need to
 		// quit early.
 		select {
+		case <-newBlockNtfnChan:
 		case <-b.quit:
-			b.newHeadersSignal.L.Unlock()
-			return
-		default:
-
+			return nil
 		}
 
 		// Re-acquire the lock in order to check for the filter header
 		// tip at the next iteration of the loop.
+		b.newHeadersMtx.RLock()
 		b.newFilterHeadersMtx.RLock()
 	}
 	b.newFilterHeadersMtx.RUnlock()
-	b.newHeadersSignal.L.Unlock()
+	b.newHeadersMtx.RUnlock()
 
 	// Now that the block headers are finished or ahead of the filter
 	// headers, we'll grab the current chain tip so we can base our filter
 	// header sync off of that.
 	lastHeader, lastHeight, err := b.cfg.BlockHeaders.ChainTip()
 	if err != nil {
-		log.Critical(err)
-		return
+		return err
 	}
 	lastHash := lastHeader.BlockHash()
 
@@ -591,29 +664,29 @@ waitForHeaders:
 	for {
 		// We'll wait until the filter header tip and the header tip
 		// are mismatched.
-		b.newHeadersSignal.L.Lock()
+		b.newHeadersMtx.RLock()
 		b.newFilterHeadersMtx.RLock()
 		for b.filterHeaderTipHash == b.headerTipHash {
 			// We'll wait here until we're woken up by the
 			// broadcast signal.
 			b.newFilterHeadersMtx.RUnlock()
-			b.newHeadersSignal.Wait()
+			b.newHeadersMtx.RUnlock()
 
 			// Before we proceed, we'll check if we need to exit at
 			// all.
 			select {
+			case <-newBlockNtfnChan:
 			case <-b.quit:
-				b.newHeadersSignal.L.Unlock()
-				return
-			default:
+				return nil
 			}
 
 			// Re-acquire the lock in order to check for the filter
 			// header tip at the next iteration of the loop.
+			b.newHeadersMtx.RLock()
 			b.newFilterHeadersMtx.RLock()
 		}
 		b.newFilterHeadersMtx.RUnlock()
-		b.newHeadersSignal.L.Unlock()
+		b.newHeadersMtx.RUnlock()
 
 		// At this point, we know that there're a set of new filter
 		// headers to fetch, so we'll grab them now.
@@ -626,14 +699,14 @@ waitForHeaders:
 			select {
 			case <-time.After(retryTimeout):
 			case <-b.quit:
-				return
+				return nil
 			}
 		}
 
 		// Quit if requested.
 		select {
 		case <-b.quit:
-			return
+			return nil
 		default:
 		}
 	}
@@ -2797,7 +2870,11 @@ func (b *blockManager) handleHeadersMsg(hmsg *headersMsg) {
 	b.headerTip = uint32(finalHeight)
 	b.headerTipHash = *finalHash
 	b.newHeadersMtx.Unlock()
-	b.newHeadersSignal.Broadcast()
+
+	if len(headerWriteBatch) > 0 {
+		header := headerWriteBatch[len(headerWriteBatch)-1]
+		b.onNewBlock(*header.BlockHeader, header.Height)
+	}
 }
 
 // checkHeaderSanity checks the PoW, and timestamp of a block header.
