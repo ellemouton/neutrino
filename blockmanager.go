@@ -173,13 +173,6 @@ type blockManager struct { // nolint:maligned
 	// time, newHeadersMtx should always be acquired first.
 	newFilterHeadersMtx sync.RWMutex
 
-	// newFilterHeadersSignal is condition variable which will be used to
-	// notify any waiting callers (via Broadcast()) that the tip of the
-	// current filter header chain has changed. This is useful when callers
-	// need to know we have a new tip, but not necessarily each filter
-	// header that was connected during switch over.
-	newFilterHeadersSignal *sync.Cond
-
 	// syncPeer points to the peer that we're currently syncing block
 	// headers from.
 	syncPeer *ServerPeer
@@ -240,11 +233,6 @@ func newBlockManager(cfg *blockManagerCfg) (*blockManager, error) {
 		minRetargetTimespan: targetTimespan / adjustmentFactor,
 		maxRetargetTimespan: targetTimespan * adjustmentFactor,
 	}
-
-	// Next we'll create the two signals that goroutines will use to wait
-	// on a particular header chain height before starting their normal
-	// duties.
-	bm.newFilterHeadersSignal = sync.NewCond(&bm.newFilterHeadersMtx)
 
 	// We fetch the genesis header to use for verifying the first received
 	// interval.
@@ -393,31 +381,12 @@ func (b *blockManager) Stop() error {
 		return nil
 	}
 
-	// We'll send out update signals before the quit to ensure that any
-	// goroutines waiting on them will properly exit.
-	done := make(chan struct{})
-	go func() {
-		ticker := time.NewTicker(time.Millisecond * 50)
-		defer ticker.Stop()
-
-		for {
-			select {
-			case <-done:
-				return
-			case <-ticker.C:
-			}
-
-			b.newFilterHeadersSignal.Broadcast()
-		}
-	}()
-
 	b.newBlockSignalManager.Stop()
 
 	log.Infof("Block manager shutting down")
 	close(b.quit)
 	b.wg.Wait()
 
-	close(done)
 	return nil
 }
 
@@ -1372,7 +1341,6 @@ func (b *blockManager) writeCFHeadersMsg(msg *wire.MsgCFHeaders,
 	b.filterHeaderTip = lastHeight
 	b.filterHeaderTipHash = lastHash
 	b.newFilterHeadersMtx.Unlock()
-	b.newFilterHeadersSignal.Broadcast()
 
 	// Notify subscribers, and also update the filter header progress
 	// logger at the same time.
