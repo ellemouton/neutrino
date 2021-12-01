@@ -951,8 +951,10 @@ var (
 
 	peer1    = "peer1:1"
 	peer2    = "peer2:1"
+	peer3    = "peer3:1"
 	addr1, _ = peer.NewOutboundPeer(&peer.Config{}, peer1)
 	addr2, _ = peer.NewOutboundPeer(&peer.Config{}, peer2)
+	addr3, _ = peer.NewOutboundPeer(&peer.Config{}, peer3)
 )
 
 func newMockPeers(t *testing.T, peers map[string]*mockPeer,
@@ -975,10 +977,11 @@ type mockPeers struct {
 }
 
 type mockPeer struct {
-	peer                        *ServerPeer
-	filterHeaders               []*chainhash.Hash
-	filters                     []*gcs.Filter
-	filterHeaderHashToHeightMap map[chainhash.Hash]uint32
+	peer                  *ServerPeer
+	checkpoints           []*chainhash.Hash
+	filterHeaders         []*chainhash.Hash
+	filters               []*gcs.Filter
+	blockHashToFilterHash map[chainhash.Hash]chainhash.Hash
 }
 
 func (m *mockPeers) banPeer(addr string, _ banman.Reason) error {
@@ -1002,6 +1005,34 @@ func (m *mockPeers) queryAllPeers(queryMsg wire.Message,
 
 	for _, p := range m.peers {
 		switch msg := queryMsg.(type) {
+		case *wire.MsgGetCFCheckpt:
+			filterHash, ok := p.blockHashToFilterHash[msg.StopHash]
+			if !ok {
+				checkResponse(p.peer, nil, make(chan struct{}),
+					make(chan struct{}))
+				return
+			}
+
+			resp := &wire.MsgCFCheckpt{
+				FilterType: wire.GCSFilterRegular,
+				StopHash:   msg.StopHash,
+			}
+
+			for _, cp := range p.checkpoints {
+				resp.FilterHeaders = append(
+					resp.FilterHeaders, cp,
+				)
+
+				if *cp == filterHash {
+					break
+				}
+			}
+
+			checkResponse(
+				p.peer, resp, make(chan struct{}),
+				make(chan struct{}),
+			)
+
 		case *wire.MsgGetCFHeaders:
 
 			resp := &wire.MsgCFHeaders{
@@ -1453,6 +1484,209 @@ func TestResolveConflicts(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSyncCheckpoints(t *testing.T) {
+	tests := []struct {
+		name            string
+		cfg             *blockManagerCfg
+		peers           map[string]*mockPeer
+		maxTries        int
+		lastBlockHeight uint32
+		lastBlockHash   *chainhash.Hash
+		lastBlockCP     chaincfg.Checkpoint
+		nextPeers       []*mockPeer
+		expectedGoodCPs []*chainhash.Hash
+		expectedAllCPs  map[string][]*chainhash.Hash
+	}{
+		{
+			name: "Happy case. All peers serve same checkpoints.",
+			cfg: &blockManagerCfg{
+				ChainParams: chaincfg.RegressionNetParams,
+			},
+			maxTries:        1,
+			lastBlockHeight: 2,
+			lastBlockHash:   hashFromStr(""),
+			peers: map[string]*mockPeer{
+				peer1: {
+					peer: &ServerPeer{Peer: addr1},
+					checkpoints: []*chainhash.Hash{
+						hashFromStr("12345c1ab369eb01b7b5fe8bf59763abb73a31471fe404a26a06be4153aa7fa5"),
+						hashFromStr("e5031471732f4fbfe7a25f6a03acc1413300d5c56ae8e06b95046b8e4c0f32b3"),
+						hashFromStr("96a31467f9edcaa3297770bc6cdf66926d5d17dfad70cb0cac285bfe9075c494"),
+					},
+					blockHashToFilterHash: map[chainhash.Hash]chainhash.Hash{
+						*hashFromStr(""): *hashFromStr("e5031471732f4fbfe7a25f6a03acc1413300d5c56ae8e06b95046b8e4c0f32b3"),
+					},
+				},
+				peer2: {
+					peer: &ServerPeer{Peer: addr2},
+					checkpoints: []*chainhash.Hash{
+						hashFromStr("12345c1ab369eb01b7b5fe8bf59763abb73a31471fe404a26a06be4153aa7fa5"),
+						hashFromStr("e5031471732f4fbfe7a25f6a03acc1413300d5c56ae8e06b95046b8e4c0f32b3"),
+					},
+					blockHashToFilterHash: map[chainhash.Hash]chainhash.Hash{
+						*hashFromStr(""): *hashFromStr("e5031471732f4fbfe7a25f6a03acc1413300d5c56ae8e06b95046b8e4c0f32b3"),
+					},
+				},
+			},
+			expectedAllCPs: map[string][]*chainhash.Hash{
+				peer1: {
+					hashFromStr("12345c1ab369eb01b7b5fe8bf59763abb73a31471fe404a26a06be4153aa7fa5"),
+					hashFromStr("e5031471732f4fbfe7a25f6a03acc1413300d5c56ae8e06b95046b8e4c0f32b3"),
+				},
+				peer2: {
+					hashFromStr("12345c1ab369eb01b7b5fe8bf59763abb73a31471fe404a26a06be4153aa7fa5"),
+					hashFromStr("e5031471732f4fbfe7a25f6a03acc1413300d5c56ae8e06b95046b8e4c0f32b3"),
+				},
+			},
+			expectedGoodCPs: []*chainhash.Hash{
+				hashFromStr("12345c1ab369eb01b7b5fe8bf59763abb73a31471fe404a26a06be4153aa7fa5"),
+			},
+		},
+		{
+			name: "Ensure last block cp is given prio",
+			cfg: &blockManagerCfg{
+				ChainParams: chaincfg.RegressionNetParams,
+			},
+			maxTries:        1,
+			lastBlockHeight: 2,
+			lastBlockHash:   hashFromStr("123"),
+			lastBlockCP: chaincfg.Checkpoint{
+				Height: 3,
+				Hash:   hashFromStr(""),
+			},
+			peers: map[string]*mockPeer{
+				peer1: {
+					peer: &ServerPeer{Peer: addr1},
+					checkpoints: []*chainhash.Hash{
+						hashFromStr("12345c1ab369eb01b7b5fe8bf59763abb73a31471fe404a26a06be4153aa7fa5"),
+						hashFromStr("e5031471732f4fbfe7a25f6a03acc1413300d5c56ae8e06b95046b8e4c0f32b3"),
+						hashFromStr("96a31467f9edcaa3297770bc6cdf66926d5d17dfad70cb0cac285bfe9075c494"),
+					},
+					blockHashToFilterHash: map[chainhash.Hash]chainhash.Hash{
+						*hashFromStr(""): *hashFromStr("96a31467f9edcaa3297770bc6cdf66926d5d17dfad70cb0cac285bfe9075c494"),
+					},
+				},
+				peer2: {
+					peer: &ServerPeer{Peer: addr2},
+					checkpoints: []*chainhash.Hash{
+						hashFromStr("12345c1ab369eb01b7b5fe8bf59763abb73a31471fe404a26a06be4153aa7fa5"),
+						hashFromStr("e5031471732f4fbfe7a25f6a03acc1413300d5c56ae8e06b95046b8e4c0f32b3"),
+					},
+				},
+			},
+			expectedAllCPs: map[string][]*chainhash.Hash{
+				peer1: {
+					hashFromStr("12345c1ab369eb01b7b5fe8bf59763abb73a31471fe404a26a06be4153aa7fa5"),
+					hashFromStr("e5031471732f4fbfe7a25f6a03acc1413300d5c56ae8e06b95046b8e4c0f32b3"),
+					hashFromStr("96a31467f9edcaa3297770bc6cdf66926d5d17dfad70cb0cac285bfe9075c494"),
+				},
+			},
+			expectedGoodCPs: []*chainhash.Hash{
+				hashFromStr("12345c1ab369eb01b7b5fe8bf59763abb73a31471fe404a26a06be4153aa7fa5"),
+			},
+		},
+		{
+			name: "let resolve conflict return nothing. ie: conflict" +
+				"and make it ban peers. then ensure that checkpints are " +
+				"fetched from next peer in queue. ",
+			cfg: &blockManagerCfg{
+				ChainParams: chaincfg.RegressionNetParams,
+			},
+			maxTries:        2,
+			lastBlockHeight: 2,
+			lastBlockHash:   hashFromStr(""),
+			peers: map[string]*mockPeer{
+				peer1: {
+					peer: &ServerPeer{Peer: addr1},
+					checkpoints: []*chainhash.Hash{
+						hashFromStr("12345c1ab369eb01b7b5fe8bf59763abb73a31471fe404a26a06be4153aa7fa5"),
+					},
+					blockHashToFilterHash: map[chainhash.Hash]chainhash.Hash{
+						*hashFromStr(""): *hashFromStr("12345c1ab369eb01b7b5fe8bf59763abb73a31471fe404a26a06be4153aa7fa5"),
+					},
+				},
+				peer2: {
+					peer: &ServerPeer{Peer: addr2},
+					checkpoints: []*chainhash.Hash{
+						hashFromStr("e5031471732f4fbfe7a25f6a03acc1413300d5c56ae8e06b95046b8e4c0f32b3"),
+					},
+					blockHashToFilterHash: map[chainhash.Hash]chainhash.Hash{
+						*hashFromStr(""): *hashFromStr("e5031471732f4fbfe7a25f6a03acc1413300d5c56ae8e06b95046b8e4c0f32b3"),
+					},
+				},
+			},
+			nextPeers: []*mockPeer{
+				{
+					peer: &ServerPeer{Peer: addr3},
+					checkpoints: []*chainhash.Hash{
+						hashFromStr("96a31467f9edcaa3297770bc6cdf66926d5d17dfad70cb0cac285bfe9075c494"),
+					},
+					blockHashToFilterHash: map[chainhash.Hash]chainhash.Hash{
+						*hashFromStr(""): *hashFromStr("96a31467f9edcaa3297770bc6cdf66926d5d17dfad70cb0cac285bfe9075c494"),
+					},
+				},
+			},
+			expectedAllCPs: map[string][]*chainhash.Hash{
+				peer3: {
+					hashFromStr("96a31467f9edcaa3297770bc6cdf66926d5d17dfad70cb0cac285bfe9075c494"),
+				},
+			},
+			expectedGoodCPs: []*chainhash.Hash{
+				hashFromStr("96a31467f9edcaa3297770bc6cdf66926d5d17dfad70cb0cac285bfe9075c494"),
+			},
+		},
+	}
+
+	for _, test := range tests {
+		peers := newMockPeers(t, test.peers, test.nextPeers...)
+		test.cfg.BanPeer = peers.banPeer
+		test.cfg.CFCheckpointInterval = 2
+		test.cfg.queryAllPeers = peers.queryAllPeers
+		test.cfg.RegFilterHeaders = &mockFilterHeaderStore{
+			headers: []*chainhash.Hash{
+				hashFromStr(""),
+			},
+		}
+		test.cfg.BlockHeaders = &mockBlockHeaderStore{
+			headers: map[chainhash.Hash]wire.BlockHeader{},
+			heights: map[uint32]wire.BlockHeader{
+				0: {},
+				2: {},
+			},
+		}
+
+		t.Run(test.name, func(t *testing.T) {
+			fm, err := newBlockManager(test.cfg)
+			require.NoError(t, err)
+
+			allCPCheckpoints := make(map[string][]*chainhash.Hash)
+			goodCPs := make([]*chainhash.Hash, 0)
+			goodCPs, allCPCheckpoints = fm.syncCheckpoints(
+				test.lastBlockHeight, test.lastBlockHash,
+				test.lastBlockCP, allCPCheckpoints,
+				time.Millisecond*100, test.maxTries,
+			)
+
+			require.True(t, compareCheckpoints(test.expectedGoodCPs, goodCPs))
+			require.True(t, compareCheckpointMaps(test.expectedAllCPs, allCPCheckpoints))
+		})
+	}
+}
+
+func compareCheckpointMaps(a, b map[string][]*chainhash.Hash) bool {
+	if len(a) != len(b) {
+		return false
+	}
+
+	for k, cps := range a {
+		if !compareCheckpoints(cps, b[k]) {
+			return false
+		}
+	}
+
+	return true
 }
 
 func compareCheckpoints(a, b []*chainhash.Hash) bool {
