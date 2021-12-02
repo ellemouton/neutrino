@@ -1010,7 +1010,7 @@ func (m *mockPeers) queryAllPeers(queryMsg wire.Message,
 			if !ok {
 				checkResponse(p.peer, nil, make(chan struct{}),
 					make(chan struct{}))
-				return
+				continue
 			}
 
 			resp := &wire.MsgCFCheckpt{
@@ -1670,6 +1670,8 @@ func TestSyncCheckpoints(t *testing.T) {
 				time.Millisecond*100, test.maxTries,
 			)
 
+			fmt.Println(test.expectedGoodCPs)
+			fmt.Println(goodCPs)
 			require.True(t, compareCheckpoints(test.expectedGoodCPs, goodCPs))
 			require.True(t, compareCheckpointMaps(test.expectedAllCPs, allCPCheckpoints))
 		})
