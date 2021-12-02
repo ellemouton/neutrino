@@ -12,6 +12,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/lightninglabs/neutrino/chainsync"
+
 	"github.com/btcsuite/btcd/addrmgr"
 	"github.com/btcsuite/btcd/blockchain"
 	"github.com/btcsuite/btcd/chaincfg"
@@ -735,6 +737,7 @@ func NewChainService(cfg Config) (*ChainService, error) {
 		GetBlock:             s.GetBlock,
 		firstPeerSignal:      s.firstPeerConnect,
 		queryAllPeers:        s.queryAllPeers,
+		BestCFCheckpoint:     chainsync.BestCFHeaderCheckpoint,
 	})
 	if err != nil {
 		return nil, err

@@ -69,6 +69,28 @@ func ControlCFHeader(params chaincfg.Params, fType wire.FilterType,
 	return nil
 }
 
+func BestCFHeaderCheckpoint(net wire.BitcoinNet, fType wire.FilterType) (
+	uint32, *chainhash.Hash, bool) {
+
+	if fType != wire.GCSFilterRegular {
+		return 0, nil, false
+	}
+
+	cp, ok := filterHeaderCheckpoints[net]
+	if !ok {
+		return 0, nil, false
+	}
+
+	var maxHeight uint32
+	for height := range cp {
+		if height > maxHeight {
+			maxHeight = height
+		}
+	}
+
+	return maxHeight, cp[maxHeight], true
+}
+
 // hashFromStr makes a chainhash.Hash from a valid hex string. If the string is
 // invalid, a nil pointer will be returned.
 func hashFromStr(hexStr string) *chainhash.Hash {

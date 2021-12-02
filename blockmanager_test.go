@@ -1676,6 +1676,147 @@ func TestSyncCheckpoints(t *testing.T) {
 	}
 }
 
+func TestHandleInvalidFilter(t *testing.T) {
+	tests := []struct {
+		name                string
+		cfg                 *blockManagerCfg
+		peers               map[string]*mockPeer
+		filterStore         []*chainhash.Hash
+		maxTries            int
+		nextPeers           []*mockPeer
+		expectedBadPeers    []string
+		expectedFilterStore []chainhash.Hash
+	}{
+		{
+			name: "peer serves correct filter.",
+			cfg: &blockManagerCfg{
+				ChainParams: chaincfg.RegressionNetParams,
+				BestCFCheckpoint: func(wire.BitcoinNet,
+					wire.FilterType) (uint32,
+					*chainhash.Hash, bool) {
+
+					return 0, nil, false
+				},
+			},
+			filterStore: []*chainhash.Hash{
+				hashFromStr(""),
+				hashFromStr(""),
+			},
+			maxTries: 1,
+			peers: map[string]*mockPeer{
+				peer1: {
+					peer: &ServerPeer{Peer: addr1},
+					filters: []*gcs.Filter{
+						{},
+						{},
+						block1Filter,
+					},
+				},
+			},
+			expectedFilterStore: []chainhash.Hash{
+				*hashFromStr(""),
+				*hashFromStr(""),
+			},
+		},
+		{
+			name: "first 2 peers serve bad filter. Rollback",
+			cfg: &blockManagerCfg{
+				ChainParams: chaincfg.RegressionNetParams,
+				BestCFCheckpoint: func(wire.BitcoinNet,
+					wire.FilterType) (uint32,
+					*chainhash.Hash, bool) {
+
+					hash := hashFromStr("bde0854d0b2f4386a860462547140e0c6817f5b4b2ab515ef70e204e377598f8")
+
+					return 1, hash, true
+				},
+			},
+			filterStore: []*chainhash.Hash{
+				hashFromStr("bde0854d0b2f4386a860462547140e0c6817f5b4b2ab515ef70e204e377598f8"),
+				hashFromStr(""),
+			},
+			maxTries: 3,
+			peers: map[string]*mockPeer{
+				peer1: {
+					peer: &ServerPeer{Peer: addr1},
+					filters: []*gcs.Filter{
+						{},
+						{},
+						block2Filter,
+					},
+				},
+			},
+			nextPeers: []*mockPeer{
+				{
+					peer: &ServerPeer{Peer: addr2},
+					filters: []*gcs.Filter{
+						{},
+						{},
+						block2Filter,
+					},
+				},
+				{
+					peer: &ServerPeer{Peer: addr3},
+					filters: []*gcs.Filter{
+						{},
+						{},
+						block1Filter,
+					},
+				},
+			},
+			expectedBadPeers: []string{peer1, peer2},
+			expectedFilterStore: []chainhash.Hash{
+				*hashFromStr("bde0854d0b2f4386a860462547140e0c6817f5b4b2ab515ef70e204e377598f8"),
+			},
+		},
+	}
+
+	for _, test := range tests {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			peers := newMockPeers(t, test.peers, test.nextPeers...)
+			test.cfg.BanPeer = peers.banPeer
+			test.cfg.queryAllPeers = peers.queryAllPeers
+			cfStore := &mockFilterHeaderStore{
+				headers: test.filterStore,
+			}
+			test.cfg.RegFilterHeaders = cfStore
+			test.cfg.BlockHeaders = &mockBlockHeaderStore{
+				headers: map[chainhash.Hash]wire.BlockHeader{},
+				heights: map[uint32]wire.BlockHeader{
+					1: {},
+				},
+			}
+
+			bm, err := newBlockManager(test.cfg)
+			require.NoError(t, err)
+
+			block := btcutil.NewBlock(block1)
+			block.SetHeight(2)
+
+			badPeers, err := bm.verifyFiltersAgainstBlock(
+				block, time.Millisecond*100, test.maxTries,
+			)
+			require.NoError(t, err)
+
+			require.Len(t, peers.bannedPeers, len(test.expectedBadPeers))
+			for _, p := range test.expectedBadPeers {
+				require.True(t, peers.bannedPeers[p])
+			}
+
+			require.Len(t, badPeers, len(test.expectedBadPeers))
+			for _, p := range test.expectedBadPeers {
+				require.True(t, badPeers[p])
+			}
+
+			require.Len(t, cfStore.headers, len(test.expectedFilterStore))
+			for i, h := range test.expectedFilterStore {
+				require.Equal(t, h, *cfStore.headers[i])
+			}
+		})
+	}
+}
+
 func compareCheckpointMaps(a, b map[string][]*chainhash.Hash) bool {
 	if len(a) != len(b) {
 		return false
@@ -1734,4 +1875,22 @@ func (m *mockFilterHeaderStore) ChainTip() (*chainhash.Hash, uint32, error) {
 
 	tipHeight := len(m.headers) - 1
 	return m.headers[tipHeight], uint32(tipHeight), nil
+}
+
+func (m *mockFilterHeaderStore) RollbackToBlock(newTip *chainhash.Hash) (
+	*headerfs.BlockStamp, error) {
+
+	i := len(m.headers) - 1
+	for ; i >= 0; i-- {
+		if *m.headers[i] == *newTip {
+			break
+		}
+
+		m.headers = m.headers[:i]
+	}
+
+	return &headerfs.BlockStamp{
+		Height: int32(i),
+		Hash:   *m.headers[i],
+	}, nil
 }

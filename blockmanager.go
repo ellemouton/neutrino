@@ -5,6 +5,7 @@ package neutrino
 import (
 	"bytes"
 	"container/list"
+	"errors"
 	"fmt"
 	"math"
 	"math/big"
@@ -116,6 +117,9 @@ type blockManagerCfg struct {
 		checkResponse func(sp *ServerPeer, resp wire.Message,
 			quit chan<- struct{}, peerQuit chan<- struct{}),
 		options ...QueryOption)
+
+	BestCFCheckpoint func(net wire.BitcoinNet, fType wire.FilterType) (
+		uint32, *chainhash.Hash, bool)
 }
 
 // blockManager provides a concurrency safe block manager for handling all
@@ -190,6 +194,8 @@ type blockManager struct { // nolint:maligned
 	newBlockSignal        *newBlockSignal
 	newBlockSignalManager *blockntfns.SubscriptionManager
 
+	blockSignal chan *btcutil.Block
+
 	wg   sync.WaitGroup
 	quit chan struct{}
 
@@ -232,6 +238,7 @@ func newBlockManager(cfg *blockManagerCfg) (*blockManager, error) {
 		blocksPerRetarget:   int32(targetTimespan / targetTimePerBlock),
 		minRetargetTimespan: targetTimespan / adjustmentFactor,
 		maxRetargetTimespan: targetTimespan * adjustmentFactor,
+		blockSignal:         make(chan *btcutil.Block),
 	}
 
 	// We fetch the genesis header to use for verifying the first received
@@ -641,10 +648,27 @@ waitForHeaders:
 			b.newFilterHeadersMtx.RUnlock()
 			b.newHeadersMtx.RUnlock()
 
-			// Before we proceed, we'll check if we need to exit at
-			// all.
 			select {
+			case block := <-b.blockSignal:
+				badPeers, err := b.verifyFiltersAgainstBlock(
+					block, retryTimeout, 0,
+				)
+				if err != nil {
+					return err
+				}
+
+				if len(badPeers) == 0 {
+					break
+				}
+
+				for p := range badPeers {
+					delete(allCFCheckpoints, p)
+				}
+
+				goto waitForHeaders
+
 			case <-newBlockNtfnChan:
+
 			case <-b.quit:
 				return nil
 			}
@@ -679,6 +703,101 @@ waitForHeaders:
 		default:
 		}
 	}
+}
+
+func (b *blockManager) verifyFiltersAgainstBlock(block *btcutil.Block,
+	retryTimeout time.Duration, maxTries int) (map[string]bool, error) {
+
+	// rescan should have something to wait on so that it knows when
+	// cfhandler is at tip or not and also which which height cfhandler is
+	// comfortable with. Rescan should not have to wait till cfhandler is
+	// necessarily at tip/current.
+
+	// when rescan calls the thing that causes this, rescan should go back
+	// to waiting on the isCurrent/is ready check mentioned above. or on a
+	// 'more filters' signal.
+
+	var (
+		foundGoodPeer bool
+		peerFilters   map[string]*gcs.Filter
+		badPeers      = make(map[string]bool)
+		numTries      int
+	)
+
+	// 1. query all peers for the filter of the given height. for each
+	//    serving an incorrect filter, ban them and also remove their entry
+	//    from the allCheckpoints map.
+	// 2. keep querying peers until get you get a peers serving a correct
+	//    looking filter for this
+	//    block. Now we can leave the peers since the cfhandler func will manager resycning now that
+	//    we know we have a good set.
+	for {
+		if maxTries > 0 {
+			if numTries >= maxTries {
+				return nil, errors.New("max tries exceeded")
+			}
+			numTries++
+		}
+
+		peerFilters = b.fetchFilterFromAllPeers(
+			uint32(block.Height()), *block.Hash(),
+			wire.GCSFilterRegular,
+		)
+
+		for p, f := range peerFilters {
+			_, err := VerifyBasicBlockFilter(f, block)
+			if err == nil {
+				foundGoodPeer = true
+				continue
+			}
+
+			log.Errorf("error verifying filter against "+
+				"downloaded block %d (%s), possibly got "+
+				"invalid filter from peer %s: %v",
+				block.Height(), block.Hash(), p, err)
+
+			err = b.cfg.BanPeer(p, banman.InvalidFilter)
+			if err != nil {
+				log.Errorf("Unable to ban peer %v: %v", p, err)
+			}
+
+			badPeers[p] = true
+		}
+
+		if foundGoodPeer {
+			break
+		}
+
+		log.Warnf("Unable to fetch any good filters from peers. " +
+			"trying again...")
+
+		select {
+		case <-time.After(retryTimeout):
+		case <-b.quit:
+			return nil, nil
+		}
+	}
+
+	// 3. now we roll back our filter header store and filter store. all the way back
+	//    to our last hardcoded filter header checkpoint. also clear from cache?
+	newHeaderTip := b.genesisHeader
+	if _, cpHash, ok := b.cfg.BestCFCheckpoint(
+		b.cfg.ChainParams.Net, wire.GCSFilterRegular,
+	); ok {
+		newHeaderTip = *cpHash
+	}
+
+	blockStamp, err := b.cfg.RegFilterHeaders.RollbackToBlock(&newHeaderTip)
+	if err != nil {
+		return nil, err
+	}
+
+	b.newFilterHeadersMtx.Lock()
+	b.filterHeaderTip = uint32(blockStamp.Height)
+	b.filterHeaderTipHash = blockStamp.Hash
+	b.newFilterHeadersMtx.Unlock()
+
+	return badPeers, nil
 }
 
 // syncCheckpoints is used to get a list of what we consider to be a list of
@@ -1390,6 +1509,11 @@ func (b *blockManager) rollBackToHeight(height uint32) (*headerfs.BlockStamp, er
 				return nil, err
 			}
 			regHeight = uint32(newFilterTip.Height)
+
+			b.newFilterHeadersMtx.Lock()
+			b.filterHeaderTip = regHeight
+			b.filterHeaderTipHash = newFilterTip.Hash
+			b.newFilterHeadersMtx.Unlock()
 		}
 
 		bs, err = b.cfg.BlockHeaders.RollbackLastBlock()

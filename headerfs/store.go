@@ -223,7 +223,7 @@ func NewBlockHeaderStore(filePath string, db walletdb.DB,
 	// Otherwise, we'll need to truncate the file until it matches the
 	// current index tip.
 	for fileHeight > tipHeight {
-		if err := bhs.singleTruncate(); err != nil {
+		if err := bhs.truncateNHeaders(1); err != nil {
 			return nil, err
 		}
 
@@ -342,7 +342,7 @@ func (h *blockHeaderStore) RollbackLastBlock() (*BlockStamp, error) {
 	// Now that we have the information we need to return from this
 	// function, we can now truncate the header file, and then use the hash
 	// of the prevHeader to set the proper index chain tip.
-	if err := h.singleTruncate(); err != nil {
+	if err := h.truncateNHeaders(1); err != nil {
 		return nil, err
 	}
 	if err := h.truncateIndex(&prevHeaderHash, true); err != nil {
@@ -628,6 +628,10 @@ type FilterHeaderStore interface {
 	// The information about the new header tip after truncation is
 	// returned.
 	RollbackLastBlock(newTip *chainhash.Hash) (*BlockStamp, error)
+
+	// RollbackToBlock rolls back the FilterHeaderStore up to the given
+	// tip.
+	RollbackToBlock(newTip *chainhash.Hash) (*BlockStamp, error)
 }
 
 // filterHeaderStore is an implementation of a fully fledged database for any
@@ -749,7 +753,7 @@ func NewFilterHeaderStore(filePath string, db walletdb.DB,
 	// Otherwise, we'll need to truncate the file until it matches the
 	// current index tip.
 	for fileHeight > tipHeight {
-		if err := fhs.singleTruncate(); err != nil {
+		if err := fhs.truncateNHeaders(1); err != nil {
 			return nil, err
 		}
 
@@ -958,7 +962,7 @@ func (f *filterHeaderStore) RollbackLastBlock(newTip *chainhash.Hash) (*BlockSta
 
 	// Now that we have the information we need to return from this
 	// function, we can now truncate both the header file and the index.
-	if err := f.singleTruncate(); err != nil {
+	if err := f.truncateNHeaders(1); err != nil {
 		return nil, err
 	}
 	if err := f.truncateIndex(newTip, false); err != nil {
@@ -969,5 +973,48 @@ func (f *filterHeaderStore) RollbackLastBlock(newTip *chainhash.Hash) (*BlockSta
 	return &BlockStamp{
 		Height: int32(newHeightTip),
 		Hash:   *newHeaderTip,
+	}, nil
+}
+
+func (f *filterHeaderStore) RollbackToBlock(newTip *chainhash.Hash) (
+	*BlockStamp, error) {
+
+	// Lock store for write.
+	f.mtx.Lock()
+	defer f.mtx.Unlock()
+
+	// First, we'll obtain the latest height that the index knows of.
+	_, chainTipHeight, err := f.chainTip()
+	if err != nil {
+		return nil, err
+	}
+
+	// Then, we get the height of the new target tip.
+	newTipHeight, err := f.heightFromHash(newTip)
+	if err != nil {
+		return nil, err
+	}
+
+	// With this height obtained, we'll use it to read what will be the new
+	// chain tip from disk.
+	newTipHeader, err := f.readHeader(newTipHeight)
+	if err != nil {
+		return nil, err
+	}
+
+	// Now that we have the information we need to return from this
+	// function, we can now truncate both the header file and the index
+	// accordingly.
+	numToTruncate := int64(chainTipHeight - newTipHeight)
+	if err := f.truncateNHeaders(numToTruncate); err != nil {
+		return nil, err
+	}
+	if err := f.truncateIndex(newTip, true); err != nil {
+		return nil, err
+	}
+
+	return &BlockStamp{
+		Height: int32(newTipHeight),
+		Hash:   *newTipHeader,
 	}, nil
 }

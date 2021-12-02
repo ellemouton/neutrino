@@ -20,6 +20,9 @@ const (
 	// InvalidFilterHeaderCheckpoint signals that a peer served us an
 	// invalid filter header checkpoint.
 	InvalidFilterHeaderCheckpoint Reason = 4
+
+	// InvalidFilter signals that a peer served us an invalid filter.
+	InvalidFilter Reason = 5
 )
 
 // String returns a human-readable description for the reason a peer was banned.
@@ -36,6 +39,9 @@ func (r Reason) String() string {
 
 	case InvalidFilterHeaderCheckpoint:
 		return "peer served invalid filter header checkpoint"
+
+	case InvalidFilter:
+		return "peer served invalid filter"
 
 	default:
 		return "unknown reason"
