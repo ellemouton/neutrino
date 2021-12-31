@@ -1078,6 +1078,7 @@ func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) e
 						)
 
 						numReplied++
+						close(peerQuit)
 					}
 				}
 
@@ -1096,6 +1097,13 @@ func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) e
 					response, sp.Addr(),
 				)
 				rejections[*broadcastErr]++
+
+				log.Debugf("Transaction %v rejected by peer "+
+					"%v: code = %v, reason = %q", txHash,
+					sp.Addr(), broadcastErr.Code,
+					broadcastErr.Reason)
+
+				close(peerQuit)
 			}
 		},
 		append(
@@ -1109,7 +1117,7 @@ func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) e
 	// transaction upon every block connected/disconnected.
 	if numReplied == 0 {
 		log.Debugf("No peers replied to inv message for transaction %v",
-			tx.TxHash())
+			txHash)
 		return nil
 	}
 
@@ -1126,7 +1134,7 @@ func (s *ChainService) sendTransaction(tx *wire.MsgTx, options ...QueryOption) e
 	// threshold of rejections instead.
 	if numReplied == len(rejections) {
 		log.Warnf("All peers rejected transaction %v checking errors",
-			tx.TxHash())
+			txHash)
 
 		mostRejectedCount := 0
 		var mostRejectedErr pushtx.BroadcastError
