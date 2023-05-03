@@ -4,6 +4,8 @@ package neutrino
 
 import (
 	"fmt"
+	"github.com/lightninglabs/neutrino/banman"
+	"github.com/lightninglabs/neutrino/query"
 	"sync"
 	"time"
 
@@ -992,74 +994,109 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 	getData := wire.NewMsgGetData()
 	_ = getData.AddInvVect(inv)
 
-	// The block is only updated from the checkResponse function argument,
-	// which is always called single-threadedly. We don't check the block
-	// until after the query is finished, so we can just write to it
-	// naively.
 	var foundBlock *btcutil.Block
-	s.queryPeers(
-		// Send a wire.GetDataMsg
-		getData,
 
-		// Check responses and if we get one that matches, end the
-		// query early.
-		func(sp *ServerPeer, resp wire.Message, quit chan<- struct{}) {
-			switch response := resp.(type) {
-			// We're only interested in "block" messages.
-			case *wire.MsgBlock:
-				// Only keep this going if we haven't already
-				// found a block, or we risk closing an already
-				// closed channel.
-				if foundBlock != nil {
-					return
-				}
+	// handleResp will be called for each message received from a peer. It
+	// will be used to signal to the work manager whether progress has been
+	// made or not.
+	handleResp := func(req, resp wire.Message,
+		peer string) query.Progress {
 
-				// If this isn't our block, ignore it.
-				if response.BlockHash() != blockHash {
-					return
-				}
-				block := btcutil.NewBlock(response)
-
-				// Only set height if btcutil hasn't
-				// automagically put one in.
-				if block.Height() == btcutil.BlockHeightUnknown {
-					block.SetHeight(int32(height))
-				}
-
-				// If this claims our block but doesn't pass
-				// the sanity check, the peer is trying to
-				// bamboozle us. Disconnect it.
-				if err := blockchain.CheckBlockSanity(
-					block,
-					// We don't need to check PoW because
-					// by the time we get here, it's been
-					// checked during header
-					// synchronization
-					s.chainParams.PowLimit,
-					s.timeSource,
-				); err != nil {
-					log.Warnf("Invalid block for %s "+
-						"received from %s -- "+
-						"disconnecting peer", blockHash,
-						sp.Addr())
-					sp.Disconnect()
-					return
-				}
-
-				// TODO(roasbeef): modify CheckBlockSanity to
-				// also check witness commitment
-
-				// At this point, the block matches what we
-				// know about it and we declare it sane. We can
-				// kill the query and pass the response back to
-				// the caller.
-				foundBlock = block
-				close(quit)
-			default:
+		// The request must have been a "getdata" msg.
+		_, ok := req.(*wire.MsgGetData)
+		if !ok {
+			return query.Progress{
+				Finished:   false,
+				Progressed: false,
 			}
-		},
-		options...,
+		}
+
+		// We're only interested in "block" responses.
+		response, ok := resp.(*wire.MsgBlock)
+		if !ok {
+			return query.Progress{
+				Finished:   false,
+				Progressed: false,
+			}
+		}
+
+		// If this isn't the block we asked for, ignore it.
+		if response.BlockHash() != blockHash {
+			return query.Progress{
+				Finished:   false,
+				Progressed: false,
+			}
+		}
+		block := btcutil.NewBlock(response)
+
+		// Only set height if btcutil hasn't automagically put one in.
+		if block.Height() == btcutil.BlockHeightUnknown {
+			block.SetHeight(int32(height))
+		}
+
+		// If this claims our block but doesn't pass the sanity check,
+		// the peer is trying to bamboozle us.
+		if err := blockchain.CheckBlockSanity(
+			block,
+			// We don't need to check PoW because by the time we get
+			// here, it's been checked during header synchronization
+			s.chainParams.PowLimit,
+			s.timeSource,
+		); err != nil {
+			log.Warnf("Invalid block for %s received from %s: %v",
+				blockHash, peer, err)
+
+			// Ban and disconnect the peer.
+			err = s.BanPeer(peer, banman.InvalidBlock)
+			if err != nil {
+				log.Errorf("Unable to ban peer %v: %v", peer,
+					err)
+			}
+
+			return query.Progress{
+				Finished:   false,
+				Progressed: false,
+			}
+		}
+
+		// TODO(roasbeef): modify CheckBlockSanity to also check witness
+		// commitment
+
+		// At this point, the block matches what we know about it, and
+		// we declare it sane. We can kill the query and pass the
+		// response back to the caller.
+		foundBlock = block
+		return query.Progress{
+			Finished:   true,
+			Progressed: true,
+		}
+	}
+
+	// Prepare the query request.
+	request := &query.Request{
+		Req:        getData,
+		HandleResp: handleResp,
+	}
+
+	// Prepare the query options.
+	queryOpts := []query.QueryOption{
+		query.Encoding(qo.encoding),
+		query.Cancel(s.quit),
+	}
+
+	// Send the request to the work manager and await a response.
+	errChan := s.queryDispatcher.Query(
+		[]*query.Request{request}, queryOpts...,
 	)
+	select {
+	case err := <-errChan:
+		if err != nil {
+			return nil, err
+		}
+	case <-s.quit:
+		return nil, ErrShuttingDown
+	}
+
 	if foundBlock == nil {
 		return nil, fmt.Errorf("couldn't retrieve block %s from "+
 			"network", blockHash)
