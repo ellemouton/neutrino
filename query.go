@@ -806,9 +806,13 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 		}
 
 		if s.persistToDisk {
-			err = s.FilterDB.PutFilter(
-				resp.blockHash, resp.filter, dbFilterType,
-			)
+			filterData := &filterdb.FilterData{
+				Filter:    resp.filter,
+				BlockHash: resp.blockHash,
+				Type:      dbFilterType,
+			}
+
+			err = s.FilterDB.PutFilter(filterData)
 			if err != nil {
 				log.Warnf("Couldn't write filter to "+
 					"filterDB: %v", err)

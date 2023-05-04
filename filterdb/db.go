@@ -36,6 +36,13 @@ var (
 	ErrFilterNotFound = fmt.Errorf("unable to find filter")
 )
 
+// FilterData holds all the info about a filter required to store it.
+type FilterData struct {
+	Filter    *gcs.Filter
+	BlockHash *chainhash.Hash
+	Type      FilterType
+}
+
 // FilterDatabase is an interface which represents an object that is capable of
 // storing and retrieving filters according to their corresponding block hash
 // and also their filter type.
@@ -44,7 +51,7 @@ var (
 type FilterDatabase interface {
 	// PutFilter stores a filter with the given hash and type to persistent
 	// storage.
-	PutFilter(*chainhash.Hash, *gcs.Filter, FilterType) error
+	PutFilter(*FilterData) error
 
 	// FetchFilter attempts to fetch a filter with the given hash and type
 	// from persistent storage. In the case that a filter matching the
@@ -157,30 +164,29 @@ func putFilter(bucket walletdb.ReadWriteBucket, hash *chainhash.Hash,
 // storage.
 //
 // NOTE: This method is a part of the FilterDatabase interface.
-func (f *FilterStore) PutFilter(hash *chainhash.Hash,
-	filter *gcs.Filter, fType FilterType) error {
-
+func (f *FilterStore) PutFilter(filterData *FilterData) error {
 	return walletdb.Update(f.db, func(tx walletdb.ReadWriteTx) error {
 		filters := tx.ReadWriteBucket(filterBucket)
 
 		var targetBucket walletdb.ReadWriteBucket
-		switch fType {
+		switch filterData.Type {
 		case RegularFilter:
 			targetBucket = filters.NestedReadWriteBucket(regBucket)
 		default:
-			return fmt.Errorf("unknown filter type: %v", fType)
+			return fmt.Errorf("unknown filter type: %v",
+				filterData.Type)
 		}
 
-		if filter == nil {
-			return targetBucket.Put(hash[:], nil)
+		if filterData.Filter == nil {
+			return targetBucket.Put(filterData.BlockHash[:], nil)
 		}
 
-		bytes, err := filter.NBytes()
+		bytes, err := filterData.Filter.NBytes()
 		if err != nil {
 			return err
 		}
 
-		return targetBucket.Put(hash[:], bytes)
+		return targetBucket.Put(filterData.BlockHash[:], bytes)
 	})
 }
 
