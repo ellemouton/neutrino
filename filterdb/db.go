@@ -31,14 +31,14 @@ const (
 )
 
 var (
-	// ErrFilterNotFound is returned when a filter for a target block hash is
-	// unable to be located.
+	// ErrFilterNotFound is returned when a filter for a target block hash
+	// is unable to be located.
 	ErrFilterNotFound = fmt.Errorf("unable to find filter")
 )
 
 // FilterDatabase is an interface which represents an object that is capable of
-// storing and retrieving filters according to their corresponding block hash and
-// also their filter type.
+// storing and retrieving filters according to their corresponding block hash
+// and also their filter type.
 //
 // TODO(roasbeef): similar interface for headerfs?
 type FilterDatabase interface {
@@ -52,7 +52,8 @@ type FilterDatabase interface {
 	// returned.
 	FetchFilter(*chainhash.Hash, FilterType) (*gcs.Filter, error)
 
-	// PurgeFilters purge all filters with a given type from persistent storage.
+	// PurgeFilters purge all filters with a given type from persistent
+	// storage.
 	PurgeFilters(FilterType) error
 }
 
@@ -117,10 +118,13 @@ func (f *FilterStore) PurgeFilters(fType FilterType) error {
 
 		switch fType {
 		case RegularFilter:
-			if err := filters.DeleteNestedBucket(regBucket); err != nil {
+			err := filters.DeleteNestedBucket(regBucket)
+			if err != nil {
 				return err
 			}
-			if _, err := filters.CreateBucket(regBucket); err != nil {
+
+			_, err = filters.CreateBucket(regBucket)
+			if err != nil {
 				return err
 			}
 		default:
