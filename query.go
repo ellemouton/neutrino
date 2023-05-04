@@ -268,20 +268,20 @@ func MaxBatchSize(maxSize int64) QueryOption {
 // Timeout functional option. The NumRetries option is set to 1 by default
 // unless overridden by the caller.
 func (s *ChainService) queryAllPeers(
-// queryMsg is the message to broadcast to all peers.
+	// queryMsg is the message to broadcast to all peers.
 	queryMsg wire.Message,
 
-// checkResponse is called for every message within the timeout period.
-// The quit channel lets the query know to terminate because the
-// required response has been found. This is done by closing the
-// channel. The peerQuit lets the query know to terminate the query for
-// the peer which sent the response, allowing releasing resources for
-// peers which respond quickly while continuing to wait for slower
-// peers to respond and nonresponsive peers to time out.
+	// checkResponse is called for every message within the timeout period.
+	// The quit channel lets the query know to terminate because the
+	// required response has been found. This is done by closing the
+	// channel. The peerQuit lets the query know to terminate the query for
+	// the peer which sent the response, allowing releasing resources for
+	// peers which respond quickly while continuing to wait for slower
+	// peers to respond and nonresponsive peers to time out.
 	checkResponse func(sp *ServerPeer, resp wire.Message,
-	quit chan<- struct{}, peerQuit chan<- struct{}),
+		quit chan<- struct{}, peerQuit chan<- struct{}),
 
-// options takes functional options for executing the query.
+	// options takes functional options for executing the query.
 	options ...QueryOption) {
 
 	// Starting with the set of default options, we'll apply any specified
@@ -812,7 +812,7 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 				Type:      dbFilterType,
 			}
 
-			err = s.FilterDB.PutFilter(filterData)
+			err = s.FilterDB.PutFilters(filterData)
 			if err != nil {
 				log.Warnf("Couldn't write filter to "+
 					"filterDB: %v", err)
