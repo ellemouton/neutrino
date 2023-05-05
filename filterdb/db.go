@@ -53,8 +53,8 @@ type FilterData struct {
 //
 // TODO(roasbeef): similar interface for headerfs?
 type FilterDatabase interface {
-	// PutFilter stores a filter to persistent storage.
-	PutFilter(*FilterData) error
+	// PutFilters stores a set of filters to persistent storage.
+	PutFilters(...*FilterData) error
 
 	// FetchFilter attempts to fetch a filter with the given hash and type
 	// from persistent storage. In the case that a filter matching the
@@ -163,26 +163,38 @@ func putFilter(bucket walletdb.ReadWriteBucket, hash *chainhash.Hash,
 	return bucket.Put(hash[:], bytes)
 }
 
-// PutFilter stores a filter with the given hash and type to persistent
-// storage.
+// PutFilters stores a set of filters to persistent storage.
 //
 // NOTE: This method is a part of the FilterDatabase interface.
-func (f *FilterStore) PutFilter(filterData *FilterData) error {
+func (f *FilterStore) PutFilters(filterList ...*FilterData) error {
 	return walletdb.Update(f.db, func(tx walletdb.ReadWriteTx) error {
 		filters := tx.ReadWriteBucket(filterBucket)
 
-		var targetBucket walletdb.ReadWriteBucket
-		switch filterData.Type {
-		case RegularFilter:
-			targetBucket = filters.NestedReadWriteBucket(regBucket)
-		default:
-			return fmt.Errorf("unknown filter type: %v",
-				filterData.Type)
+		for _, filterData := range filterList {
+			var targetBucket walletdb.ReadWriteBucket
+			switch filterData.Type {
+			case RegularFilter:
+				targetBucket = filters.NestedReadWriteBucket(
+					regBucket,
+				)
+			default:
+				return fmt.Errorf("unknown filter type: %v",
+					filterData.Type)
+			}
+
+			err := putFilter(
+				targetBucket, filterData.BlockHash,
+				filterData.Filter,
+			)
+			if err != nil {
+				return err
+			}
+
+			log.Tracef("Wrote filter for block %s, type %d",
+				&filterData.BlockHash, filterData.Type)
 		}
 
-		return putFilter(
-			targetBucket, filterData.BlockHash, filterData.Filter,
-		)
+		return nil
 	})
 }
 
