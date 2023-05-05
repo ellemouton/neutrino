@@ -185,6 +185,9 @@ func (f *FilterStore) PutFilters(filterList ...*FilterData) error {
 			if err != nil {
 				return err
 			}
+
+			log.Tracef("Wrote filter for block %s, type %d",
+				filterData.BlockHash, filterData.Type)
 		}
 
 		return nil
