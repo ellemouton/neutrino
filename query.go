@@ -268,20 +268,20 @@ func MaxBatchSize(maxSize int64) QueryOption {
 // Timeout functional option. The NumRetries option is set to 1 by default
 // unless overridden by the caller.
 func (s *ChainService) queryAllPeers(
-// queryMsg is the message to broadcast to all peers.
+	// queryMsg is the message to broadcast to all peers.
 	queryMsg wire.Message,
 
-// checkResponse is called for every message within the timeout period.
-// The quit channel lets the query know to terminate because the
-// required response has been found. This is done by closing the
-// channel. The peerQuit lets the query know to terminate the query for
-// the peer which sent the response, allowing releasing resources for
-// peers which respond quickly while continuing to wait for slower
-// peers to respond and nonresponsive peers to time out.
+	// checkResponse is called for every message within the timeout period.
+	// The quit channel lets the query know to terminate because the
+	// required response has been found. This is done by closing the
+	// channel. The peerQuit lets the query know to terminate the query for
+	// the peer which sent the response, allowing releasing resources for
+	// peers which respond quickly while continuing to wait for slower
+	// peers to respond and nonresponsive peers to time out.
 	checkResponse func(sp *ServerPeer, resp wire.Message,
-	quit chan<- struct{}, peerQuit chan<- struct{}),
+		quit chan<- struct{}, peerQuit chan<- struct{}),
 
-// options takes functional options for executing the query.
+	// options takes functional options for executing the query.
 	options ...QueryOption) {
 
 	// Starting with the set of default options, we'll apply any specified
@@ -686,7 +686,7 @@ func (s *ChainService) prepareCFiltersQuery(blockHash chainhash.Hash,
 		filterHeaders: filterHeaders,
 		headerIndex:   headerIndex,
 		targetHash:    blockHash,
-		filterChan:    make(chan *filterResponse, numFilters),
+		filterChan:    make(chan *filterResponse),
 		quit:          s.quit,
 	}, nil
 }
@@ -834,23 +834,6 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 		numRecv := numFilters - int64(len(q.headerIndex))
 		log.Errorf("Query failed with %d out of %d filters received",
 			numRecv, numFilters)
-	}
-
-	for {
-		select {
-		case filterResp, ok = <-q.filterChan:
-			if !ok {
-				break
-			}
-
-			handleNewFilter(filterResp)
-			continue
-
-		case <-s.quit:
-			return nil, ErrShuttingDown
-		}
-
-		break
 	}
 
 	// Query has finished, if we have a result we'll return it.

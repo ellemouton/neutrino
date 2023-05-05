@@ -115,7 +115,6 @@ func (b *BatchWriter[T]) manageNewItems() {
 
 			return
 		}
-
 	}
 
 	ticker := time.NewTicker(b.cfg.DBWritesTickerDuration)
