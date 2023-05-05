@@ -4,8 +4,6 @@ import (
 	"compress/bzip2"
 	"encoding/binary"
 	"fmt"
-	"github.com/lightninglabs/neutrino/query"
-	"github.com/stretchr/testify/require"
 	"io"
 	"math/big"
 	"math/rand"
@@ -24,6 +22,8 @@ import (
 	"github.com/lightninglabs/neutrino/cache/lru"
 	"github.com/lightninglabs/neutrino/filterdb"
 	"github.com/lightninglabs/neutrino/headerfs"
+	"github.com/lightninglabs/neutrino/query"
+	"github.com/stretchr/testify/require"
 )
 
 var (
