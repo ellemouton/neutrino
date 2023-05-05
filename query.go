@@ -836,6 +836,23 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 			numRecv, numFilters)
 	}
 
+	for {
+		select {
+		case filterResp, ok = <-q.filterChan:
+			if !ok {
+				break
+			}
+
+			handleNewFilter(filterResp)
+			continue
+
+		case <-s.quit:
+			return nil, ErrShuttingDown
+		}
+
+		break
+	}
+
 	// Query has finished, if we have a result we'll return it.
 	if resultFilter == nil {
 		return nil, ErrFilterFetchFailed
