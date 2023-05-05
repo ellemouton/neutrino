@@ -806,22 +806,11 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 		}
 
 		if s.persistToDisk {
-			filterData := &filterdb.FilterData{
+			s.filterBatchWriter.AddItem(&filterdb.FilterData{
 				Filter:    resp.filter,
 				BlockHash: resp.blockHash,
 				Type:      dbFilterType,
-			}
-
-			err = s.FilterDB.PutFilters(filterData)
-			if err != nil {
-				log.Warnf("Couldn't write filter to "+
-					"filterDB: %v", err)
-
-				return
-			}
-
-			log.Tracef("Wrote filter for block %s, type %d",
-				resp.blockHash, dbFilterType)
+			})
 		}
 	}
 
