@@ -64,7 +64,7 @@ type ChainSource interface {
 	// GetCFilter returns the filter of the given type for the block with
 	// the given hash.
 	GetCFilter(chainhash.Hash, wire.FilterType,
-	...QueryOption) (*gcs.Filter, error)
+		...QueryOption) (*gcs.Filter, error)
 
 	// Subscribe returns a block subscription that delivers block
 	// notifications in order. The bestHeight parameter can be used to
@@ -438,6 +438,39 @@ func (rs *rescanState) rescan() error {
 		return height >= uint32(rs.curStamp.Height)
 	}); err != nil {
 		return err
+	}
+
+	// To ensure that we batch as many filter queries as possible, we also
+	// wait for the header chain to either be current or for it to at least
+	// have caught up with the specified end block.
+	r, ok := chain.(*RescanChainSource)
+	if ok {
+		log.Debugf("Waiting for the chain source to be current or " +
+			"for the rescan end height to be reached.")
+
+		if err := rs.waitForBlocks(func(hash chainhash.Hash,
+			height uint32) bool {
+
+			// If the header chain is current, then there is no need
+			// to wait.
+			if r.IsCurrent() {
+				return true
+			}
+
+			// If an end height was specified then we wait until the
+			// notification corresponding to that block height.
+			if ro.endBlock.Height > 0 &&
+				height >= uint32(ro.endBlock.Height) {
+
+				return true
+			}
+
+			// If a block hash was specified, check if the
+			// notification is for that block.
+			return hash == ro.endBlock.Hash
+		}); err != nil {
+			return err
+		}
 	}
 
 	log.Debugf("Starting rescan from known block %d (%s)",
