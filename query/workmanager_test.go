@@ -5,6 +5,8 @@ import (
 	"sort"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 type mockWorker struct {
@@ -63,7 +65,7 @@ func (p *mockPeerRanking) Reward(peer string) {
 
 // startWorkManager starts a new workmanager with the given number of mock
 // workers.
-func startWorkManager(t *testing.T, numWorkers int) (*WorkManager,
+func startWorkManager(t *testing.T, numWorkers int) (WorkManager,
 	[]*mockWorker) {
 
 	// We set up a custom NewWorker closure for the WorkManager, such that
@@ -71,7 +73,7 @@ func startWorkManager(t *testing.T, numWorkers int) (*WorkManager,
 	workerChan := make(chan *mockWorker)
 
 	peerChan := make(chan Peer)
-	wm := New(&Config{
+	wm := NewWorkManager(&Config{
 		ConnectedPeers: func() (<-chan Peer, func(), error) {
 			return peerChan, func() {}, nil
 		},
@@ -384,7 +386,10 @@ func TestWorkManagerWorkRankingScheduling(t *testing.T) {
 	const numQueries = 4
 	const numWorkers = 8
 
-	wm, workers := startWorkManager(t, numWorkers)
+	workMgr, workers := startWorkManager(t, numWorkers)
+
+	wm, ok := workMgr.(*workManager)
+	require.True(t, ok)
 
 	// Set up the ranking to prioritize lower numbered workers.
 	wm.cfg.Ranking.(*mockPeerRanking).less = func(i, j string) bool {
