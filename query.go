@@ -762,12 +762,14 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 	errChan := s.workManager.Query(
 		[]*query.Request{filterQuery.request()},
 		query.Cancel(s.quit),
+		query.NoRetries(),
 		query.Encoding(qo.encoding),
 	)
 
 	select {
 	case err := <-errChan:
 		if err != nil {
+			fmt.Println("actually got error from err Chan!", err)
 			return nil, err
 		}
 

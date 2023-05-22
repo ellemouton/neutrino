@@ -3,6 +3,7 @@ package query
 import (
 	"container/heap"
 	"errors"
+	"fmt"
 	"sync"
 	"time"
 )
@@ -175,9 +176,10 @@ func (w *workManager) workDispatcher() {
 	heap.Init(work)
 
 	type batchProgress struct {
-		timeout <-chan time.Time
-		rem     int
-		errChan chan error
+		noRetries bool
+		timeout   <-chan time.Time
+		rem       int
+		errChan   chan error
 	}
 
 	// We set up a batch index counter to keep track of batches that still
@@ -329,6 +331,28 @@ Loop:
 			// If the query ended with any other error, put it back
 			// into the work queue.
 			case result.err != nil:
+				if batch.noRetries {
+					// Decrement the number of queries
+					// remaining in the batch.
+					if batch != nil {
+						batch.rem--
+						log.Tracef("Remaining jobs for batch "+
+							"%v: %v ", batchNum, batch.rem)
+
+						// If this was the last query in flight
+						// for this batch, we can notify that
+						// it finished, and delete it.
+						if batch.rem == 0 {
+							batch.errChan <- fmt.Errorf("no first try")
+							delete(currentBatches, batchNum)
+
+							log.Tracef("Batch %v done",
+								batchNum)
+							continue Loop
+						}
+					}
+				}
+
 				// Punish the peer for the failed query.
 				w.cfg.Ranking.Punish(result.peer.Addr())
 
@@ -416,9 +440,10 @@ Loop:
 			}
 
 			currentBatches[batchIndex] = &batchProgress{
-				timeout: time.After(batch.options.timeout),
-				rem:     len(batch.requests),
-				errChan: batch.errChan,
+				noRetries: batch.options.noRetries,
+				timeout:   time.After(batch.options.timeout),
+				rem:       len(batch.requests),
+				errChan:   batch.errChan,
 			}
 			batchIndex++
 

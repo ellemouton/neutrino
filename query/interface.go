@@ -30,6 +30,8 @@ type queryOptions struct {
 	// cancelChan is an optional channel that can be closed to indicate
 	// that the query should be canceled.
 	cancelChan chan struct{}
+
+	noRetries bool
 }
 
 // QueryOption is a functional option argument to any of the network query
@@ -59,6 +61,12 @@ func (qo *queryOptions) applyQueryOptions(options ...QueryOption) {
 func Timeout(timeout time.Duration) QueryOption {
 	return func(qo *queryOptions) {
 		qo.timeout = timeout
+	}
+}
+
+func NoRetries() QueryOption {
+	return func(qo *queryOptions) {
+		qo.noRetries = true
 	}
 }
 
