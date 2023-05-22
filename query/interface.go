@@ -14,6 +14,10 @@ const (
 	// defaultQueryEncoding specifies the default encoding (witness or not)
 	// for `getdata` and other similar messages.
 	defaultQueryEncoding = wire.WitnessEncoding
+
+	// defaultNumRetries is the default number of times that a query job
+	// will be retried.
+	defaultNumRetries = 2
 )
 
 // queries are a set of options that can be modified per-query, unlike global
@@ -31,7 +35,9 @@ type queryOptions struct {
 	// that the query should be canceled.
 	cancelChan chan struct{}
 
-	noRetries bool
+	// numRetries is the number of times that a query should be retried
+	// before failing.
+	numRetries uint8
 }
 
 // QueryOption is a functional option argument to any of the network query
@@ -46,6 +52,7 @@ func defaultQueryOptions() *queryOptions {
 		timeout:    defaultQueryTimeout,
 		encoding:   defaultQueryEncoding,
 		cancelChan: nil,
+		numRetries: defaultNumRetries,
 	}
 }
 
@@ -64,9 +71,11 @@ func Timeout(timeout time.Duration) QueryOption {
 	}
 }
 
-func NoRetries() QueryOption {
+// NumRetries is a query option that specifies the number of times a query
+// should be retried.
+func NumRetries(num uint8) QueryOption {
 	return func(qo *queryOptions) {
-		qo.noRetries = true
+		qo.numRetries = num
 	}
 }
 

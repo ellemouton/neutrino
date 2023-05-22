@@ -762,8 +762,9 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 	errChan := s.workManager.Query(
 		[]*query.Request{filterQuery.request()},
 		query.Cancel(s.quit),
-		query.NoRetries(),
 		query.Encoding(qo.encoding),
+		query.Timeout(qo.timeout),
+		query.NumRetries(qo.numRetries),
 	)
 
 	select {
