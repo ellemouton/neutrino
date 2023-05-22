@@ -169,9 +169,10 @@ func (w *WorkManager) workDispatcher() {
 	heap.Init(work)
 
 	type batchProgress struct {
-		timeout <-chan time.Time
-		rem     int
-		errChan chan error
+		maxRetries uint8
+		timeout    <-chan time.Time
+		rem        int
+		errChan    chan error
 	}
 
 	// We set up a batch index counter to keep track of batches that still
@@ -321,10 +322,47 @@ Loop:
 				}
 
 			// If the query ended with any other error, put it back
-			// into the work queue.
+			// into the work queue if it has not reached the
+			// maximum number of retries.
 			case result.err != nil:
 				// Punish the peer for the failed query.
 				w.cfg.Ranking.Punish(result.peer.Addr())
+
+				result.job.tries++
+
+				// Check if this query has reached its maximum
+				// number of retries. If so, remove it from the
+				// batch and don't reschedule it.
+				if batch != nil &&
+					result.job.tries >= batch.maxRetries {
+
+					log.Warnf("Query(%d) from peer %v "+
+						"failed and reached maximum "+
+						"number of retries, not "+
+						"rescheduling: %v",
+						result.job.index,
+						result.peer.Addr(), result.err)
+
+					// Decrement the number of queries
+					// remaining in the batch.
+					batch.rem--
+					log.Tracef("Remaining jobs for batch "+
+						"%v: %v ", batchNum, batch.rem)
+
+					if batch.rem > 0 {
+						break
+					}
+
+					// If this was the last query in flight
+					// for this batch, we can notify that
+					// it finished, and delete it.
+					batch.errChan <- result.err
+					delete(currentBatches, batchNum)
+
+					log.Tracef("Batch %v done", batchNum)
+
+					continue Loop
+				}
 
 				log.Warnf("Query(%d) from peer %v failed, "+
 					"rescheduling: %v", result.job.index,
@@ -343,7 +381,7 @@ Loop:
 				heap.Push(work, result.job)
 				currentQueries[result.job.index] = batchNum
 
-			// Otherwise we got a successful result and  update the
+			// Otherwise, we got a successful result and update the
 			// status of the batch this query is a part of.
 			default:
 				// Reward the peer for the successful query.
@@ -410,9 +448,10 @@ Loop:
 			}
 
 			currentBatches[batchIndex] = &batchProgress{
-				timeout: time.After(batch.options.timeout),
-				rem:     len(batch.requests),
-				errChan: batch.errChan,
+				maxRetries: batch.options.numRetries,
+				timeout:    time.After(batch.options.timeout),
+				rem:        len(batch.requests),
+				errChan:    batch.errChan,
 			}
 			batchIndex++
 
