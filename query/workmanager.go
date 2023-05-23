@@ -377,7 +377,9 @@ Loop:
 
 				// If it was a timeout, we dynamically increase
 				// it for the next attempt.
-				if result.err == ErrQueryTimeout {
+				if result.err == ErrQueryTimeout &&
+					!result.job.staticTimeout {
+
 					newTimeout := result.job.timeout * 2
 					if newTimeout > maxQueryTimeout {
 						newTimeout = maxQueryTimeout
@@ -442,13 +444,20 @@ Loop:
 			log.Debugf("Adding new batch(%d) of %d queries to "+
 				"work queue", batchIndex, len(batch.requests))
 
+			withStaticTimeout := batch.options.staticTimeout
+			timeout := minQueryTimeout
+			if withStaticTimeout {
+				timeout = batch.options.peerTimeout
+			}
+
 			for _, q := range batch.requests {
 				heap.Push(work, &queryJob{
-					index:      queryIndex,
-					timeout:    minQueryTimeout,
-					encoding:   batch.options.encoding,
-					cancelChan: batch.options.cancelChan,
-					Request:    q,
+					index:         queryIndex,
+					timeout:       timeout,
+					staticTimeout: withStaticTimeout,
+					encoding:      batch.options.encoding,
+					cancelChan:    batch.options.cancelChan,
+					Request:       q,
 				})
 				currentQueries[queryIndex] = batchIndex
 				queryIndex++

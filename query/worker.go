@@ -24,11 +24,12 @@ var (
 // queryJob is the internal struct that wraps the Query to work on, in
 // addition to some information about the query.
 type queryJob struct {
-	tries      uint8
-	index      uint64
-	timeout    time.Duration
-	encoding   wire.MessageEncoding
-	cancelChan <-chan struct{}
+	tries         uint8
+	index         uint64
+	timeout       time.Duration
+	staticTimeout bool
+	encoding      wire.MessageEncoding
+	cancelChan    <-chan struct{}
 	*Request
 }
 

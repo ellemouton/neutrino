@@ -764,6 +764,7 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 		query.Cancel(s.quit),
 		query.Encoding(qo.encoding),
 		query.NumRetries(qo.numRetries),
+		query.PeerTimeout(qo.timeout),
 	)
 
 	select {
@@ -910,6 +911,7 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 		query.Encoding(qo.encoding),
 		query.Cancel(s.quit),
 		query.NumRetries(qo.numRetries),
+		query.PeerTimeout(qo.timeout),
 	}
 
 	// Send the request to the work manager and await a response.
