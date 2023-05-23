@@ -763,7 +763,6 @@ func (s *ChainService) GetCFilter(blockHash chainhash.Hash,
 		[]*query.Request{filterQuery.request()},
 		query.Cancel(s.quit),
 		query.Encoding(qo.encoding),
-		query.Timeout(qo.timeout),
 		query.NumRetries(qo.numRetries),
 	)
 
@@ -910,6 +909,7 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 	queryOpts := []query.QueryOption{
 		query.Encoding(qo.encoding),
 		query.Cancel(s.quit),
+		query.NumRetries(qo.numRetries),
 	}
 
 	// Send the request to the work manager and await a response.

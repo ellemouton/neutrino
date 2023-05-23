@@ -38,6 +38,8 @@ type queryOptions struct {
 	// numRetries is the number of times that a query should be retried
 	// before failing.
 	numRetries uint8
+
+	retryForever bool
 }
 
 // QueryOption is a functional option argument to any of the network query
@@ -67,6 +69,12 @@ func (qo *queryOptions) applyQueryOptions(options ...QueryOption) {
 func NumRetries(num uint8) QueryOption {
 	return func(qo *queryOptions) {
 		qo.numRetries = num
+	}
+}
+
+func RetryForever() QueryOption {
+	return func(qo *queryOptions) {
+		qo.retryForever = true
 	}
 }
 

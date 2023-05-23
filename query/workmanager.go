@@ -175,10 +175,11 @@ func (w *workManager) workDispatcher() {
 	heap.Init(work)
 
 	type batchProgress struct {
-		maxRetries uint8
-		timeout    <-chan time.Time
-		rem        int
-		errChan    chan error
+		retryForever bool
+		maxRetries   uint8
+		timeout      <-chan time.Time
+		rem          int
+		errChan      chan error
 	}
 
 	// We set up a batch index counter to keep track of batches that still
@@ -339,7 +340,7 @@ Loop:
 				// Check if this query has reached its maximum
 				// number of retries. If so, remove it from the
 				// batch and don't reschedule it.
-				if batch != nil &&
+				if batch != nil && !batch.retryForever &&
 					result.job.tries >= batch.maxRetries {
 
 					log.Warnf("Query(%d) from peer %v "+
@@ -454,10 +455,11 @@ Loop:
 			}
 
 			currentBatches[batchIndex] = &batchProgress{
-				maxRetries: batch.options.numRetries,
-				timeout:    time.After(batch.options.timeout),
-				rem:        len(batch.requests),
-				errChan:    batch.errChan,
+				retryForever: batch.options.retryForever,
+				maxRetries:   batch.options.numRetries,
+				timeout:      time.After(batch.options.timeout),
+				rem:          len(batch.requests),
+				errChan:      batch.errChan,
 			}
 			batchIndex++
 
