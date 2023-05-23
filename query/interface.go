@@ -40,6 +40,10 @@ type queryOptions struct {
 	numRetries uint8
 
 	retryForever bool
+
+	peerTimeout time.Duration
+
+	staticTimeout bool
 }
 
 // QueryOption is a functional option argument to any of the network query
@@ -75,6 +79,13 @@ func NumRetries(num uint8) QueryOption {
 func RetryForever() QueryOption {
 	return func(qo *queryOptions) {
 		qo.retryForever = true
+	}
+}
+
+func PeerTimeout(timeout time.Duration) QueryOption {
+	return func(qo *queryOptions) {
+		qo.peerTimeout = timeout
+		qo.staticTimeout = true
 	}
 }
 

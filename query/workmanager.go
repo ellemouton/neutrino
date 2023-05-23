@@ -377,7 +377,9 @@ Loop:
 
 				// If it was a timeout, we dynamically increase
 				// it for the next attempt.
-				if result.err == ErrQueryTimeout {
+				if result.err == ErrQueryTimeout &&
+					!result.job.staticTimeout {
+
 					newTimeout := result.job.timeout * 2
 					if newTimeout > maxQueryTimeout {
 						newTimeout = maxQueryTimeout

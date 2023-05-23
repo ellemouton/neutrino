@@ -910,6 +910,7 @@ func (s *ChainService) GetBlock(blockHash chainhash.Hash,
 		query.Encoding(qo.encoding),
 		query.Cancel(s.quit),
 		query.NumRetries(qo.numRetries),
+		query.PeerTimeout(qo.timeout),
 	}
 
 	// Send the request to the work manager and await a response.
